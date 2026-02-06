@@ -10,11 +10,11 @@ from dataclasses import dataclass, asdict
 
 from openai import OpenAI
 
-from models import (
+from .models import (
     SynthesizedResponse, FlowStep, DecisionPoint,
     ConfigItem, EvidenceRef, EvidenceCard
 )
-from utils import has_causal_verb, CAUSAL_VERBS
+from .utils import has_causal_verb, CAUSAL_VERBS
 
 
 SYNTHESIZER_SYSTEM_PROMPT = """你是代碼庫專家。

@@ -7,8 +7,8 @@ import re
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 
-from models import QueryIntent
-from utils import build_keyword_variants
+from .models import QueryIntent
+from .utils import build_keyword_variants
 
 
 # ========== Query Templates ==========

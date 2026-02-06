@@ -8,7 +8,7 @@ from collections import Counter
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 
-from models import EvidenceCard
+from .models import EvidenceCard
 
 
 @dataclass

@@ -28,8 +28,8 @@ except ImportError:
     MCP_AVAILABLE = False
     print("Warning: MCP not installed. Run: pip install mcp")
 
-from agentic_search import AgenticSearch, AgenticSearchConfig
-from models import SearchResult
+from .agentic_search import AgenticSearch, AgenticSearchConfig
+from .models import SearchResult
 
 
 # 初始化搜索代理
@@ -210,8 +210,8 @@ if MCP_AVAILABLE:
             operator = arguments.get("operator", "semantic")
             top_k = arguments.get("top_k", 10)
 
-            from hybrid_search import HybridSearch
-            from reranker import create_reranker
+            from .hybrid_search import HybridSearch
+            from .reranker import create_reranker
 
             search = HybridSearch()
             reranker = create_reranker(use_cross_encoder=False)  # 用簡單 reranker 加速

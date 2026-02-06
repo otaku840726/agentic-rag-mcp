@@ -9,7 +9,7 @@ from dataclasses import dataclass, asdict
 
 from openai import OpenAI
 
-from models import (
+from .models import (
     PlannerOutput, QueryIntent, MissingEvidence,
     EvidenceCard, SearchState
 )

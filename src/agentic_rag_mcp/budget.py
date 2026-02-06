@@ -5,8 +5,8 @@ Budget & Quality Gate - 預算控制和質量門檻
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
-from models import EvidenceCard, MissingEvidence, SearchState, Budget, QualityGate
-from utils import check_accept_coverage
+from .models import EvidenceCard, MissingEvidence, SearchState, Budget, QualityGate
+from .utils import check_accept_coverage
 
 
 class BudgetManager:
