@@ -1,0 +1,93 @@
+# Agentic RAG MCP Server Configuration
+
+# Qdrant Vector DB
+qdrant:
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+  collection: "${QDRANT_COLLECTION}"
+
+# Embedding Model (for hybrid search - semantic part)
+embedding:
+  provider: "openai"
+  model: "text-embedding-3-small"
+  dimension: 1536
+
+# Reranker (Cross-encoder, not LLM)
+reranker:
+  model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  top_n: 100  # Hybrid search returns this many
+  top_m: 20   # Rerank keeps this many
+
+# Planner LLM (short output, structured)
+planner:
+  provider: "openai"  # or "anthropic"
+  model: "gpt-4o-mini"
+  max_tokens: 1000
+  temperature: 0.1
+
+# Synthesizer LLM (final integration)
+synthesizer:
+  provider: "openai"
+  model: "gpt-4o-mini"
+  max_tokens: 2000
+  temperature: 0.2
+
+# LLM Judge (for is_satisfied when uncertain)
+judge:
+  provider: "openai"
+  model: "gpt-4o-mini"
+  max_tokens: 100
+  temperature: 0
+
+# Budget & Limits
+budget:
+  max_iterations: 5
+  max_tokens_per_round: 2000
+  total_token_budget: 15000
+  max_evidence_cards: 200
+  working_set_size: 20
+
+# Quality Gate
+quality_gate:
+  min_code_evidence: 2
+  min_tag_diversity: 2
+  require_call_edge: true
+  require_named_entity: true
+
+# Evidence Store
+evidence_store:
+  max_pool: 200
+  working_set_size: 20
+  eviction_weights:
+    score: 1.0
+    recency: 0.2
+    kind_rarity: 0.2
+    tag_rarity: 0.15
+
+# Query Templates
+query_templates:
+  entry_point:
+    annotations:
+      - "@EventListener"
+      - "@Scheduled"
+      - "@KafkaListener"
+      - "@RabbitListener"
+      - "@PostMapping"
+      - "@GetMapping"
+      - "[HttpPost]"
+      - "[HttpGet]"
+      - "[Route]"
+
+  callsite:
+    patterns:
+      - '"{class}.{method}"'
+      - '"{class}#{method}"'
+      - '"{class}::{method}"'
+      - '"{method}("'
+      - 'await {method}'
+
+# MCP Server
+mcp:
+  name: "agentic-rag"
+  version: "1.0.0"
+  description: "Agentic RAG search for codebase"
