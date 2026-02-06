@@ -21,8 +21,8 @@ from .query_builder import QueryBuilder
 from .budget import StopConditionChecker
 from .hybrid_search import HybridSearch, HybridSearchBatch
 from .reranker import create_reranker
-from .planner import Planner, PlannerConfig
-from .synthesizer import Synthesizer, SynthesizerConfig
+from .planner import Planner
+from .synthesizer import Synthesizer
 
 
 @dataclass
@@ -49,9 +49,7 @@ class AgenticSearchConfig:
     # Reranker
     use_cross_encoder: bool = True
 
-    # LLM
-    planner_model: str = "gpt-4o-mini"
-    synthesizer_model: str = "gpt-4o-mini"
+    # LLM models are now configured in config.yaml (planner/synthesizer sections)
 
 
 class AgenticSearch:
@@ -69,8 +67,8 @@ class AgenticSearch:
         self.hybrid_search = HybridSearch()
         self.batch_search = HybridSearchBatch(self.hybrid_search)
         self.reranker = create_reranker(self.config.use_cross_encoder)
-        self.planner = Planner(PlannerConfig(model=self.config.planner_model))
-        self.synthesizer = Synthesizer(SynthesizerConfig(model=self.config.synthesizer_model))
+        self.planner = Planner()
+        self.synthesizer = Synthesizer()
 
         # 停機條件
         budget = Budget(

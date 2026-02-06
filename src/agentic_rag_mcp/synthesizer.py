@@ -3,13 +3,11 @@ Synthesizer LLM - 最終整合回應
 只在循環結束後調用一次
 """
 
-import os
 import json
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
 
-from openai import OpenAI
-
+from .provider import create_client_for
 from .models import (
     SynthesizedResponse, FlowStep, DecisionPoint,
     ConfigItem, EvidenceRef, EvidenceCard
@@ -82,19 +80,13 @@ class Synthesizer:
 
     def __init__(self, config: Optional[SynthesizerConfig] = None):
         self.config = config or SynthesizerConfig()
-
-        # 檢查是否使用本地 LLM
-        use_local = os.getenv("USE_LOCAL_LLM", "false").lower() == "true"
-        if use_local:
-            local_url = os.getenv("LOCAL_LLM_URL", "http://127.0.0.1:1234/v1")
-            local_model = os.getenv("LOCAL_LLM_MODEL", "qwen/qwen3-4b-thinking-2507")
-            self.client = OpenAI(base_url=local_url, api_key="not-needed")
-            self.config.model = local_model
-            print(f"[Synthesizer] Using local LLM: {local_url} / {local_model}")
-        elif self.config.provider == "openai":
-            self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        else:
-            raise ValueError(f"Unsupported provider: {self.config.provider}")
+        client, comp_cfg = create_client_for("synthesizer")
+        self.client = client
+        if not config:
+            self.config.provider = comp_cfg.provider
+            self.config.model = comp_cfg.model
+            self.config.max_tokens = comp_cfg.max_tokens
+            self.config.temperature = comp_cfg.temperature
 
     def synthesize(
         self,
@@ -119,8 +111,6 @@ class Synthesizer:
         user_prompt = self._build_user_prompt(query, evidence_cards)
 
         # 調用 LLM
-        use_local = os.getenv("USE_LOCAL_LLM", "false").lower() == "true"
-
         kwargs = {
             "model": self.config.model,
             "messages": [
@@ -131,8 +121,7 @@ class Synthesizer:
             "temperature": self.config.temperature,
         }
 
-        # 本地 LLM 可能不支援 response_format
-        if not use_local:
+        if self.config.provider != "local":
             kwargs["response_format"] = {"type": "json_object"}
 
         response = self.client.chat.completions.create(**kwargs)

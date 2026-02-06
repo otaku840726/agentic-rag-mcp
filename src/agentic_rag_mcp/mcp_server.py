@@ -35,18 +35,24 @@ from .models import SearchResult
 # 初始化搜索代理
 search_agent = None
 
+# 初始化索引服務
+indexer_service = None
+
+
+def get_indexer_service():
+    """獲取或創建索引服務（單例）"""
+    global indexer_service
+    if indexer_service is None:
+        from .indexer import IndexerService
+        indexer_service = IndexerService()
+    return indexer_service
+
 
 def get_search_agent() -> AgenticSearch:
     """獲取或創建搜索代理（單例）"""
     global search_agent
     if search_agent is None:
-        config = AgenticSearchConfig(
-            max_iterations=int(os.getenv("MAX_ITERATIONS", "5")),
-            total_token_budget=int(os.getenv("TOKEN_BUDGET", "15000")),
-            planner_model=os.getenv("PLANNER_MODEL", "gpt-4o-mini"),
-            synthesizer_model=os.getenv("SYNTHESIZER_MODEL", "gpt-4o-mini"),
-        )
-        search_agent = AgenticSearch(config)
+        search_agent = AgenticSearch()
     return search_agent
 
 
@@ -170,9 +176,9 @@ if MCP_AVAILABLE:
                         },
                         "operator": {
                             "type": "string",
-                            "enum": ["semantic", "keyword", "exact"],
-                            "description": "Search operator (default: semantic)",
-                            "default": "semantic"
+                            "enum": ["hybrid", "semantic", "keyword", "exact"],
+                            "description": "Search operator: hybrid (dense+sparse RRF fusion, recommended), semantic (dense only), keyword (BM25 sparse only), exact (string match). Default: hybrid",
+                            "default": "hybrid"
                         },
                         "top_k": {
                             "type": "integer",
@@ -181,6 +187,75 @@ if MCP_AVAILABLE:
                         }
                     },
                     "required": ["query"]
+                }
+            ),
+            Tool(
+                name="index-files",
+                description="""
+                Index specific files into the Qdrant vector database.
+                Reads files, chunks them, generates dense+sparse embeddings, and upserts to Qdrant.
+                Metadata (category/service/layer) is auto-inferred from file paths (extension, directory name).
+
+                Use this to keep the index up-to-date after editing files.
+                """,
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file_paths": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "File paths relative to codebase root"
+                        },
+                        "metadata": {
+                            "type": "object",
+                            "description": "Optional extra metadata to merge into auto-inferred metadata",
+                            "additionalProperties": True
+                        }
+                    },
+                    "required": ["file_paths"]
+                }
+            ),
+            Tool(
+                name="index-status",
+                description="""
+                Show the current indexing status.
+                Returns Qdrant collection stats (points_count, by_category) and local state (indexed files count, last index time).
+                """,
+                inputSchema={
+                    "type": "object",
+                    "properties": {}
+                }
+            ),
+            Tool(
+                name="index-by-pattern",
+                description="""
+                Batch-index files matching a glob pattern.
+                Scans files under codebase root, auto-excludes binary/build directories, indexes incrementally.
+
+                Examples:
+                - "knowledge/**/*.yaml" — index all YAML in knowledge/
+                - "docs/**/*.md" — index all markdown docs
+                - "src/**/*.cs" — index all C# source files
+                """,
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob pattern relative to codebase root (e.g. 'knowledge/**/*.yaml')"
+                        },
+                        "metadata": {
+                            "type": "object",
+                            "description": "Optional extra metadata to merge (e.g. {\"category\": \"knowledge-base\"})",
+                            "additionalProperties": True
+                        },
+                        "force": {
+                            "type": "boolean",
+                            "description": "Force re-index even if files haven't changed (default: false)",
+                            "default": False
+                        }
+                    },
+                    "required": ["pattern"]
                 }
             )
         ]
@@ -207,7 +282,7 @@ if MCP_AVAILABLE:
 
         elif name == "quick-search":
             query = arguments.get("query", "")
-            operator = arguments.get("operator", "semantic")
+            operator = arguments.get("operator", "hybrid")
             top_k = arguments.get("top_k", 10)
 
             from .hybrid_search import HybridSearch
@@ -229,6 +304,30 @@ if MCP_AVAILABLE:
                 parts.append(f"```\n{content}\n```\n")
 
             return [TextContent(type="text", text="\n".join(parts))]
+
+        elif name == "index-files":
+            file_paths = arguments.get("file_paths", [])
+            metadata = arguments.get("metadata")
+            if not file_paths:
+                return [TextContent(type="text", text="Error: file_paths is required and must not be empty")]
+            svc = get_indexer_service()
+            result = svc.index_files(file_paths, metadata=metadata)
+            return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
+
+        elif name == "index-status":
+            svc = get_indexer_service()
+            result = svc.get_status()
+            return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False, default=str))]
+
+        elif name == "index-by-pattern":
+            pattern = arguments.get("pattern", "")
+            metadata = arguments.get("metadata")
+            force = arguments.get("force", False)
+            if not pattern:
+                return [TextContent(type="text", text="Error: pattern is required")]
+            svc = get_indexer_service()
+            result = svc.index_by_pattern(pattern, metadata=metadata, force=force)
+            return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]

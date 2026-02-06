@@ -32,7 +32,7 @@ QUERY_TEMPLATES = {
             '[HttpGet]',
             '[Route]',
         ],
-        "operator": "semantic",
+        "operator": "hybrid",
         "filters": {"category": ["source-code"]}
     },
 
@@ -53,7 +53,7 @@ QUERY_TEMPLATES = {
             'transition AND "{keyword}"',
             'UpdateStatus OR ChangeState OR SetState',
         ],
-        "operator": "semantic",
+        "operator": "hybrid",
         "filters": {}
     },
 
@@ -98,7 +98,7 @@ QUERY_TEMPLATES = {
             'try.*{keyword}.*catch',
             '"{keyword}Exception" OR "{keyword}Error"',
         ],
-        "operator": "semantic",
+        "operator": "hybrid",
         "filters": {"category": ["source-code"]}
     },
 }
@@ -159,10 +159,10 @@ class QueryBuilder:
                 "filters": intent.filters or {}
             })
 
-        else:  # semantic
+        else:  # semantic / hybrid
             queries.append({
                 "query": intent.query,
-                "operator": "semantic",
+                "operator": "hybrid",
                 "filters": intent.filters or {}
             })
 

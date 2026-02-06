@@ -156,8 +156,50 @@ TOKEN_BUDGET=15000
 
 參數：
 - `query` (必填): 搜索查詢
-- `operator` (可選): `semantic`、`keyword` 或 `exact` (預設: `semantic`)
+- `operator` (可選): `hybrid`、`semantic`、`keyword` 或 `exact` (預設: `hybrid`)
 - `top_k` (可選): 返回結果數量 (預設: 10)
+
+### `index-files`
+
+索引指定文件到 Qdrant 向量數據庫。讀取 → 分塊 → dense+sparse embedding → upsert。metadata 根據 config.yaml patterns 自動推斷。
+
+```
+適用於：
+- 編輯文件後立即更新索引
+- 索引新增的文件
+```
+
+參數：
+- `file_paths` (必填): 相對於 codebase root 的文件路徑陣列
+- `metadata` (可選): 額外 metadata，會合併到自動推斷的 metadata
+
+### `index-status`
+
+查看當前索引狀態，包括 Qdrant collection 統計和本地狀態。
+
+```
+返回：
+- Qdrant stats: points_count, by_category 分佈
+- 本地狀態: 已索引文件數, 上次索引時間
+```
+
+參數：無
+
+### `index-by-pattern`
+
+按 glob pattern 批量索引文件，自動排除 binary/build 目錄，支持增量索引。
+
+```
+範例：
+- "knowledge/**/*.yaml"
+- "docs/**/*.md"
+- "src/**/*.cs"
+```
+
+參數：
+- `pattern` (必填): glob pattern（相對於 codebase root）
+- `metadata` (可選): 額外 metadata（例如 `{"category": "knowledge-base"}`）
+- `force` (可選): 強制重新索引 (預設: false)
 
 ## 架構
 
@@ -205,6 +247,7 @@ TOKEN_BUDGET=15000
 | `budget.py` | 預算和質量門檻 |
 | `models.py` | 資料結構定義 |
 | `utils.py` | 工具函數 |
+| `indexer/` | 索引服務子包 (index-files, index-status, index-source) |
 
 ## 配置選項
 

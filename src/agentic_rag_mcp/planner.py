@@ -2,13 +2,11 @@
 Planner LLM - 生成下一輪查詢的短輸出結構化模型
 """
 
-import os
 import json
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
 
-from openai import OpenAI
-
+from .provider import create_client_for
 from .models import (
     PlannerOutput, QueryIntent, MissingEvidence,
     EvidenceCard, SearchState
@@ -48,8 +46,9 @@ PLANNER_SYSTEM_PROMPT = """你是代碼庫搜索 Planner。
 }
 
 **查詢類型說明:**
-- semantic: 語義搜索，適合模糊概念
-- keyword: 關鍵字搜索，適合技術名詞
+- hybrid: 混合搜索 (dense + sparse BM25 RRF fusion)，推薦預設使用
+- semantic: 純語義搜索，適合模糊概念
+- keyword: BM25 關鍵字搜索，適合技術名詞、SP名、類名精確匹配
 - exact: 精確匹配，適合類名、方法名
 - symbol_ref: 符號引用搜索
 - callsite: 調用點搜索，如 "methodName("
@@ -80,19 +79,14 @@ class Planner:
 
     def __init__(self, config: Optional[PlannerConfig] = None):
         self.config = config or PlannerConfig()
-
-        # 檢查是否使用本地 LLM
-        use_local = os.getenv("USE_LOCAL_LLM", "false").lower() == "true"
-        if use_local:
-            local_url = os.getenv("LOCAL_LLM_URL", "http://127.0.0.1:1234/v1")
-            local_model = os.getenv("LOCAL_LLM_MODEL", "qwen/qwen3-4b-thinking-2507")
-            self.client = OpenAI(base_url=local_url, api_key="not-needed")
-            self.config.model = local_model
-            print(f"[Planner] Using local LLM: {local_url} / {local_model}")
-        elif self.config.provider == "openai":
-            self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        else:
-            raise ValueError(f"Unsupported provider: {self.config.provider}")
+        client, comp_cfg = create_client_for("planner")
+        self.client = client
+        # config.yaml 的值優先，但允許外部傳入覆蓋
+        if not config:
+            self.config.provider = comp_cfg.provider
+            self.config.model = comp_cfg.model
+            self.config.max_tokens = comp_cfg.max_tokens
+            self.config.temperature = comp_cfg.temperature
 
     def plan(
         self,
@@ -121,8 +115,6 @@ class Planner:
         )
 
         # 調用 LLM
-        use_local = os.getenv("USE_LOCAL_LLM", "false").lower() == "true"
-
         kwargs = {
             "model": self.config.model,
             "messages": [
@@ -133,8 +125,8 @@ class Planner:
             "temperature": self.config.temperature,
         }
 
-        # 本地 LLM 可能不支援 response_format
-        if not use_local:
+        # 非 local provider 才使用 response_format
+        if self.config.provider != "local":
             kwargs["response_format"] = {"type": "json_object"}
 
         response = self.client.chat.completions.create(**kwargs)
@@ -248,16 +240,11 @@ class LLMJudge:
 
     def __init__(self, config: Optional[PlannerConfig] = None):
         self.config = config or PlannerConfig(max_tokens=100)
-
-        # 檢查是否使用本地 LLM
-        use_local = os.getenv("USE_LOCAL_LLM", "false").lower() == "true"
-        if use_local:
-            local_url = os.getenv("LOCAL_LLM_URL", "http://127.0.0.1:1234/v1")
-            local_model = os.getenv("LOCAL_LLM_MODEL", "qwen/qwen3-4b-thinking-2507")
-            self.client = OpenAI(base_url=local_url, api_key="not-needed")
-            self.config.model = local_model
-        else:
-            self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        client, comp_cfg = create_client_for("judge")
+        self.client = client
+        if not config:
+            self.config.provider = comp_cfg.provider
+            self.config.model = comp_cfg.model
 
     def judge(
         self,
@@ -288,8 +275,6 @@ class LLMJudge:
 
 只回答 JSON: {{"satisfied": true/false, "reason": "一句話理由"}}"""
 
-        use_local = os.getenv("USE_LOCAL_LLM", "false").lower() == "true"
-
         kwargs = {
             "model": self.config.model,
             "messages": [{"role": "user", "content": prompt}],
@@ -297,7 +282,7 @@ class LLMJudge:
             "temperature": 0,
         }
 
-        if not use_local:
+        if self.config.provider != "local":
             kwargs["response_format"] = {"type": "json_object"}
 
         response = self.client.chat.completions.create(**kwargs)

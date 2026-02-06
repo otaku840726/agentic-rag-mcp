@@ -1,6 +1,6 @@
 """
-Hybrid Search - Embedding + Keyword 搜索
-連接 Qdrant 向量數據庫
+Hybrid Search - Dense + Sparse (BM25) + RRF Fusion
+連接 Qdrant 向量數據庫，支持真正的 hybrid search
 """
 
 import os
@@ -13,9 +13,14 @@ from qdrant_client.http.models import (
     FieldCondition,
     MatchValue,
     MatchAny,
+    Prefetch,
+    FusionQuery,
+    Fusion,
+    SparseVector as QdrantSparseVector,
 )
-from openai import OpenAI
 import tiktoken
+
+from .provider import load_config, create_client, get_component_config
 
 
 @dataclass
@@ -29,28 +34,71 @@ class SearchConfig:
 
 
 class HybridSearch:
-    """混合搜索引擎"""
+    """混合搜索引擎 - 支持 dense, sparse (BM25), hybrid (RRF fusion)"""
 
     def __init__(self, config: Optional[SearchConfig] = None):
-        # 從環境變量或配置加載
+        cfg = load_config()
+        qdrant_cfg = cfg.get("qdrant", {})
+
         self.config = config or SearchConfig(
-            qdrant_url=os.getenv("QDRANT_URL", ""),
-            qdrant_api_key=os.getenv("QDRANT_API_KEY", ""),
-            collection_name=os.getenv("QDRANT_COLLECTION", "codebase"),
+            qdrant_url=qdrant_cfg.get("url") or os.getenv("QDRANT_URL", ""),
+            qdrant_api_key=qdrant_cfg.get("api_key") or os.getenv("QDRANT_API_KEY", ""),
+            collection_name=qdrant_cfg.get("collection") or os.getenv("QDRANT_COLLECTION", "codebase"),
         )
 
-        # 初始化客戶端
+        # Embedding component config
+        embed_cfg = get_component_config("embedding")
+        self.config.embedding_model = embed_cfg.model
+
+        # Qdrant client
         self.qdrant = QdrantClient(
             url=self.config.qdrant_url,
             api_key=self.config.qdrant_api_key
         )
-        self.openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+        # Embedding client (from provider)
+        self.openai = create_client(embed_cfg.provider)
         self.encoding = tiktoken.get_encoding("cl100k_base")
+
+        # Lazy-loaded sparse embedder
+        self._sparse_embedder = None
+        self._sparse_support = None  # None = not yet checked
+
+    def _check_sparse_support(self) -> bool:
+        """檢測 collection 是否有 sparse vectors (向後兼容)"""
+        if self._sparse_support is not None:
+            return self._sparse_support
+
+        try:
+            info = self.qdrant.get_collection(self.config.collection_name)
+            sparse_config = info.config.params.sparse_vectors
+            self._sparse_support = bool(sparse_config and "sparse" in sparse_config)
+        except Exception:
+            self._sparse_support = False
+
+        return self._sparse_support
+
+    def _get_sparse_embedder(self):
+        """Lazy-load sparse embedder (SPLADE++)"""
+        if self._sparse_embedder is None:
+            from fastembed import SparseTextEmbedding
+            self._sparse_embedder = SparseTextEmbedding(model_name="prithivida/Splade_PP_en_v1")
+        return self._sparse_embedder
+
+    def _sparse_embed_query(self, query: str) -> QdrantSparseVector:
+        """用 BM25 生成 sparse query vector"""
+        model = self._get_sparse_embedder()
+        results = list(model.embed([query]))
+        embedding = results[0]
+        return QdrantSparseVector(
+            indices=embedding.indices.tolist(),
+            values=embedding.values.tolist()
+        )
 
     def search(
         self,
         query: str,
-        operator: str = "semantic",
+        operator: str = "hybrid",
         filters: Optional[Dict[str, Any]] = None,
         top_n: Optional[int] = None
     ) -> List[Dict[str, Any]]:
@@ -59,7 +107,7 @@ class HybridSearch:
 
         Args:
             query: 查詢字串
-            operator: semantic | keyword | exact
+            operator: hybrid | semantic | keyword | exact
             filters: 過濾條件 {"source_kind": ["code"], "category": "...", ...}
             top_n: 返回數量
 
@@ -68,15 +116,25 @@ class HybridSearch:
         """
         top_n = top_n or self.config.top_n
 
-        if operator == "semantic":
+        if operator == "hybrid":
+            if self._check_sparse_support():
+                return self._hybrid_search(query, filters, top_n)
+            else:
+                # Fallback: no sparse vectors in collection
+                return self._semantic_search(query, filters, top_n)
+        elif operator == "semantic":
             return self._semantic_search(query, filters, top_n)
         elif operator == "keyword":
-            return self._keyword_search(query, filters, top_n)
+            if self._check_sparse_support():
+                return self._keyword_search(query, filters, top_n)
+            else:
+                # Fallback: semantic with enhanced query
+                return self._semantic_search(f"exact match: {query}", filters, top_n)
         elif operator == "exact":
             return self._exact_search(query, filters, top_n)
         else:
-            # 默認使用語義搜索
-            return self._semantic_search(query, filters, top_n)
+            return self._hybrid_search(query, filters, top_n) if self._check_sparse_support() \
+                else self._semantic_search(query, filters, top_n)
 
     def _semantic_search(
         self,
@@ -84,21 +142,28 @@ class HybridSearch:
         filters: Optional[Dict],
         top_n: int
     ) -> List[Dict[str, Any]]:
-        """語義搜索 - 使用向量相似度"""
-        # 生成查詢向量
+        """語義搜索 - 使用 dense 向量相似度"""
         query_vector = self._embed_query(query)
-
-        # 構建過濾器
         qdrant_filter = self._build_filter(filters)
 
-        # 執行搜索 (使用新 API query_points)
-        results = self.qdrant.query_points(
-            collection_name=self.config.collection_name,
-            query=query_vector,
-            limit=top_n,
-            query_filter=qdrant_filter,
-            with_payload=True
-        )
+        # Use named vector if collection has sparse support (named vectors)
+        if self._check_sparse_support():
+            results = self.qdrant.query_points(
+                collection_name=self.config.collection_name,
+                query=query_vector,
+                using="dense",
+                limit=top_n,
+                query_filter=qdrant_filter,
+                with_payload=True
+            )
+        else:
+            results = self.qdrant.query_points(
+                collection_name=self.config.collection_name,
+                query=query_vector,
+                limit=top_n,
+                query_filter=qdrant_filter,
+                with_payload=True
+            )
 
         return self._format_results(results.points, "semantic")
 
@@ -108,18 +173,54 @@ class HybridSearch:
         filters: Optional[Dict],
         top_n: int
     ) -> List[Dict[str, Any]]:
-        """
-        關鍵字搜索
-        Note: Qdrant 原生不支援全文搜索，這裡使用 payload 搜索模擬
-        實際生產環境可能需要配合 Elasticsearch 或 Qdrant 的 sparse vectors
-        """
-        # 對於 Qdrant，我們使用 scroll + filter 來模擬關鍵字搜索
-        # 或者回退到語義搜索但用關鍵字增強查詢
+        """關鍵字搜索 - 使用 BM25 sparse vector"""
+        sparse_vector = self._sparse_embed_query(query)
+        qdrant_filter = self._build_filter(filters)
 
-        # 這裡使用語義搜索作為 fallback
-        # 真正的 keyword 搜索需要額外的索引支持
-        enhanced_query = f"exact match: {query}"
-        return self._semantic_search(enhanced_query, filters, top_n)
+        results = self.qdrant.query_points(
+            collection_name=self.config.collection_name,
+            query=sparse_vector,
+            using="sparse",
+            limit=top_n,
+            query_filter=qdrant_filter,
+            with_payload=True
+        )
+
+        return self._format_results(results.points, "keyword")
+
+    def _hybrid_search(
+        self,
+        query: str,
+        filters: Optional[Dict],
+        top_n: int
+    ) -> List[Dict[str, Any]]:
+        """混合搜索 - prefetch dense + sparse, RRF fusion"""
+        dense_vector = self._embed_query(query)
+        sparse_vector = self._sparse_embed_query(query)
+        qdrant_filter = self._build_filter(filters)
+
+        results = self.qdrant.query_points(
+            collection_name=self.config.collection_name,
+            prefetch=[
+                Prefetch(
+                    query=dense_vector,
+                    using="dense",
+                    limit=top_n,
+                    filter=qdrant_filter,
+                ),
+                Prefetch(
+                    query=sparse_vector,
+                    using="sparse",
+                    limit=top_n,
+                    filter=qdrant_filter,
+                ),
+            ],
+            query=FusionQuery(fusion=Fusion.RRF),
+            limit=top_n,
+            with_payload=True
+        )
+
+        return self._format_results(results.points, "hybrid")
 
     def _exact_search(
         self,
@@ -127,16 +228,16 @@ class HybridSearch:
         filters: Optional[Dict],
         top_n: int
     ) -> List[Dict[str, Any]]:
-        """
-        精確搜索 - 嘗試在 payload 中匹配
-        """
-        # 清理查詢
+        """精確搜索 - 嘗試在 payload 中匹配"""
         clean_query = query.strip('"\'')
 
-        # 先用語義搜索獲取候選
-        results = self._semantic_search(query, filters, top_n * 2)
+        # Use hybrid or semantic to get candidates
+        if self._check_sparse_support():
+            results = self._hybrid_search(query, filters, top_n * 2)
+        else:
+            results = self._semantic_search(query, filters, top_n * 2)
 
-        # 然後過濾包含精確字串的結果
+        # Filter for exact string matches in content
         filtered = []
         for r in results:
             content = r.get("content", "") or r.get("payload", {}).get("content_preview", "")
@@ -144,7 +245,7 @@ class HybridSearch:
                 r["exact_match"] = True
                 filtered.append(r)
 
-        # 如果精確匹配太少，補充語義結果
+        # Supplement with non-exact results if too few
         if len(filtered) < top_n // 2:
             for r in results:
                 if r not in filtered:
@@ -175,7 +276,6 @@ class HybridSearch:
                 continue
 
             if isinstance(value, list):
-                # 多值匹配
                 conditions.append(
                     FieldCondition(
                         key=key,
@@ -183,7 +283,6 @@ class HybridSearch:
                     )
                 )
             else:
-                # 單值匹配
                 conditions.append(
                     FieldCondition(
                         key=key,
@@ -235,6 +334,7 @@ class HybridSearch:
                 "name": self.config.collection_name,
                 "points_count": info.points_count,
                 "status": str(info.status),
+                "has_sparse": self._check_sparse_support(),
             }
         except Exception as e:
             return {"error": str(e)}
@@ -267,7 +367,7 @@ class HybridSearchBatch:
         for q in queries:
             results = self.engine.search(
                 query=q.get("query", ""),
-                operator=q.get("operator", "semantic"),
+                operator=q.get("operator", "hybrid"),
                 filters=q.get("filters"),
                 top_n=top_n_per_query
             )
