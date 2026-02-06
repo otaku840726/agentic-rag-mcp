@@ -35,6 +35,7 @@ qdrant:
 embedding:
   provider: ${EMBEDDING_PROVIDER:-openai}
   model: ${EMBEDDING_MODEL:-text-embedding-3-small}
+  max_tokens: ${EMBEDDING_MAX_TOKENS:-8191}
   dimension: 1536
 
 # Reranker (Cross-encoder, runs locally, no provider needed)

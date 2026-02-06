@@ -88,7 +88,10 @@ class IndexerService:
     @property
     def chunker(self) -> Chunker:
         if self._chunker is None:
-            self._chunker = Chunker(max_chunk_size=4000, overlap=200)
+            from ..provider import load_config
+            cfg = load_config()
+            max_tokens = int(cfg.get("embedding", {}).get("max_tokens", 8191))
+            self._chunker = Chunker(max_tokens=max_tokens)
         return self._chunker
 
     @property

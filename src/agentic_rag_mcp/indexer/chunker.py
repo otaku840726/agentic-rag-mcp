@@ -1,11 +1,13 @@
 """
 文件分塊模組
-根據文件類型智能分塊
+根據文件類型智能分塊，按 token 數控制大小以匹配 embedding model 限制
 """
 
 import re
 from typing import List, Dict, Any
 from dataclasses import dataclass
+
+import tiktoken
 
 
 @dataclass
@@ -18,32 +20,65 @@ class Chunk:
 
 
 class Chunker:
-    """智能分塊器"""
+    """智能分塊器 — 按 token 數切割"""
 
-    def __init__(self, max_chunk_size: int = 4000, overlap: int = 200):
+    def __init__(self, max_tokens: int = 8191, overlap_tokens: int = 50):
         """
         Args:
-            max_chunk_size: 最大塊大小 (字符數)
-            overlap: 塊之間的重疊 (字符數)
+            max_tokens: 每個 chunk 的最大 token 數（應 <= embedding model 限制）
+            overlap_tokens: chunk 之間的重疊 token 數
         """
-        self.max_chunk_size = max_chunk_size
-        self.overlap = overlap
+        self.max_tokens = max_tokens
+        self.overlap_tokens = overlap_tokens
+        self._enc = tiktoken.get_encoding("cl100k_base")
+
+    def _token_len(self, text: str) -> int:
+        return len(self._enc.encode(text))
+
+    def _force_split_by_tokens(self, text: str) -> List[str]:
+        """將超長文本按 token 數強制切割"""
+        tokens = self._enc.encode(text)
+        chunks = []
+        start = 0
+        while start < len(tokens):
+            end = min(start + self.max_tokens, len(tokens))
+            chunks.append(self._enc.decode(tokens[start:end]))
+            start = end - self.overlap_tokens if end < len(tokens) else end
+        return chunks
+
+    def _accumulate_parts(self, parts: List[str]) -> List[str]:
+        """通用累積邏輯：將 parts 按 token 上限累積成 chunks"""
+        chunks = []
+        current_chunk = ""
+        current_tokens = 0
+
+        for part in parts:
+            part_tokens = self._token_len(part)
+
+            if current_tokens + part_tokens > self.max_tokens:
+                if current_chunk.strip():
+                    chunks.append(current_chunk)
+                if part_tokens > self.max_tokens:
+                    chunks.extend(self._force_split_by_tokens(part))
+                    current_chunk = ""
+                    current_tokens = 0
+                else:
+                    current_chunk = part
+                    current_tokens = part_tokens
+            else:
+                current_chunk += part
+                current_tokens += part_tokens
+
+        if current_chunk.strip():
+            chunks.append(current_chunk)
+
+        return chunks
 
     def chunk_file(self, content: str, file_path: str, metadata: Dict[str, Any] = None) -> List[Chunk]:
-        """根據文件類型分塊
-
-        Args:
-            content: 文件內容
-            file_path: 文件路徑 (用於判斷類型)
-            metadata: 基礎 metadata
-
-        Returns:
-            分塊列表
-        """
+        """根據文件類型分塊"""
         metadata = metadata or {}
 
-        # 如果內容夠小，直接返回
-        if len(content) <= self.max_chunk_size:
+        if self._token_len(content) <= self.max_tokens:
             return [Chunk(
                 content=content,
                 index=1,
@@ -51,7 +86,6 @@ class Chunker:
                 metadata={**metadata, "chunk_index": 1, "total_chunks": 1}
             )]
 
-        # 根據文件類型選擇分塊策略
         ext = file_path.lower().split('.')[-1] if '.' in file_path else ''
 
         if ext == 'cs':
@@ -71,191 +105,74 @@ class Chunker:
 
     def _chunk_csharp(self, content: str, metadata: Dict) -> List[Chunk]:
         """C# 代碼分塊 - 按 class/method 分割"""
-        chunks = []
-
-        # 嘗試按 class 分割
         class_pattern = r'((?:public|private|internal|protected)?\s*(?:static\s+)?(?:partial\s+)?class\s+\w+[^{]*\{)'
         parts = re.split(class_pattern, content)
 
         if len(parts) > 1:
-            # 有多個 class
-            current_chunk = parts[0]  # 開頭的 using statements 等
+            merged = [parts[0]]
             for i in range(1, len(parts), 2):
                 if i + 1 < len(parts):
-                    class_content = parts[i] + parts[i + 1]
-                    if len(current_chunk) + len(class_content) > self.max_chunk_size:
-                        if current_chunk.strip():
-                            chunks.append(current_chunk)
-                        current_chunk = class_content
-                    else:
-                        current_chunk += class_content
-            if current_chunk.strip():
-                chunks.append(current_chunk)
+                    merged.append(parts[i] + parts[i + 1])
+                else:
+                    merged.append(parts[i])
+            chunks = self._accumulate_parts(merged)
         else:
-            # 單個 class 或沒有 class，使用通用分塊
             return self._chunk_generic(content, metadata)
 
         return self._finalize_chunks(chunks, metadata)
 
     def _chunk_python(self, content: str, metadata: Dict) -> List[Chunk]:
         """Python 代碼分塊 - 按 class/function 分割"""
-        chunks = []
-
-        # 按 class 或頂級 def 分割
-        pattern = r'\n(?=class\s+\w+|def\s+\w+)'
-        parts = re.split(pattern, content)
-
-        current_chunk = ""
-        for part in parts:
-            if len(current_chunk) + len(part) > self.max_chunk_size:
-                if current_chunk.strip():
-                    chunks.append(current_chunk)
-                current_chunk = part
-            else:
-                current_chunk += part
-
-        if current_chunk.strip():
-            chunks.append(current_chunk)
-
+        parts = re.split(r'\n(?=class\s+\w+|def\s+\w+)', content)
+        chunks = self._accumulate_parts(parts)
         return self._finalize_chunks(chunks, metadata)
 
     def _chunk_sql(self, content: str, metadata: Dict) -> List[Chunk]:
         """SQL 分塊 - 按 CREATE/ALTER 語句分割"""
-        chunks = []
-
-        # 按主要 SQL 語句分割
-        pattern = r'(?=CREATE\s+(?:TABLE|PROCEDURE|FUNCTION|VIEW|INDEX)|ALTER\s+(?:TABLE|PROCEDURE))'
-        parts = re.split(pattern, content, flags=re.IGNORECASE)
-
-        current_chunk = ""
-        for part in parts:
-            if len(current_chunk) + len(part) > self.max_chunk_size:
-                if current_chunk.strip():
-                    chunks.append(current_chunk)
-                current_chunk = part
-            else:
-                current_chunk += part
-
-        if current_chunk.strip():
-            chunks.append(current_chunk)
-
+        parts = re.split(
+            r'(?=CREATE\s+(?:TABLE|PROCEDURE|FUNCTION|VIEW|INDEX)|ALTER\s+(?:TABLE|PROCEDURE))',
+            content, flags=re.IGNORECASE,
+        )
+        chunks = self._accumulate_parts(parts)
         return self._finalize_chunks(chunks, metadata)
 
     def _chunk_yaml(self, content: str, metadata: Dict) -> List[Chunk]:
         """YAML 分塊 - 按頂級 key 分割"""
-        chunks = []
-
-        # 按頂級 key 分割 (行首非空白字符開頭)
-        pattern = r'\n(?=\S)'
-        parts = re.split(pattern, content)
-
-        current_chunk = ""
-        for part in parts:
-            if len(current_chunk) + len(part) > self.max_chunk_size:
-                if current_chunk.strip():
-                    chunks.append(current_chunk)
-                current_chunk = part
-            else:
-                current_chunk += "\n" + part if current_chunk else part
-
-        if current_chunk.strip():
-            chunks.append(current_chunk)
-
+        parts = re.split(r'\n(?=\S)', content)
+        chunks = self._accumulate_parts(parts)
         return self._finalize_chunks(chunks, metadata)
 
     def _chunk_markdown(self, content: str, metadata: Dict) -> List[Chunk]:
         """Markdown 分塊 - 按標題分割"""
-        chunks = []
-
-        # 按 ## 標題分割
-        pattern = r'\n(?=##\s+)'
-        parts = re.split(pattern, content)
-
-        current_chunk = ""
-        for part in parts:
-            if len(current_chunk) + len(part) > self.max_chunk_size:
-                if current_chunk.strip():
-                    chunks.append(current_chunk)
-                current_chunk = part
-            else:
-                current_chunk += "\n" + part if current_chunk else part
-
-        if current_chunk.strip():
-            chunks.append(current_chunk)
-
+        parts = re.split(r'\n(?=##\s+)', content)
+        chunks = self._accumulate_parts(parts)
         return self._finalize_chunks(chunks, metadata)
 
     def _chunk_json(self, content: str, metadata: Dict) -> List[Chunk]:
-        """JSON 分塊 - 通用分塊 (JSON 結構難以安全分割)"""
         return self._chunk_generic(content, metadata)
 
     def _chunk_generic(self, content: str, metadata: Dict) -> List[Chunk]:
-        """通用分塊 - 按段落或固定大小"""
-        chunks = []
-
-        # 嘗試按雙換行符分割 (段落)
+        """通用分塊 - 按段落分割，超長強制切割"""
         paragraphs = content.split('\n\n')
-
-        current_chunk = ""
-        for para in paragraphs:
-            if len(current_chunk) + len(para) + 2 > self.max_chunk_size:
-                if current_chunk.strip():
-                    chunks.append(current_chunk)
-                # 如果單個段落就超過限制，強制分割
-                if len(para) > self.max_chunk_size:
-                    for i in range(0, len(para), self.max_chunk_size - self.overlap):
-                        chunks.append(para[i:i + self.max_chunk_size])
-                    current_chunk = ""
-                else:
-                    current_chunk = para
-            else:
-                current_chunk += "\n\n" + para if current_chunk else para
-
-        if current_chunk.strip():
-            chunks.append(current_chunk)
-
+        chunks = self._accumulate_parts(paragraphs)
         return self._finalize_chunks(chunks, metadata)
 
     def _finalize_chunks(self, chunks: List[str], metadata: Dict) -> List[Chunk]:
-        """將字符串列表轉換為 Chunk 對象列表"""
-        total = len(chunks)
+        """轉換為 Chunk 列表，安全網：最終確保每個 chunk 不超限"""
+        safe_chunks = []
+        for chunk in chunks:
+            if self._token_len(chunk) > self.max_tokens:
+                safe_chunks.extend(self._force_split_by_tokens(chunk))
+            else:
+                safe_chunks.append(chunk)
+
+        total = len(safe_chunks)
         return [
             Chunk(
-                content=chunk,
+                content=c,
                 index=i + 1,
                 total=total,
                 metadata={**metadata, "chunk_index": i + 1, "total_chunks": total}
             )
-            for i, chunk in enumerate(chunks)
+            for i, c in enumerate(safe_chunks)
         ]
-
-
-if __name__ == "__main__":
-    # 測試
-    chunker = Chunker(max_chunk_size=500)
-
-    # 測試 C# 分塊
-    csharp_code = '''
-using System;
-
-namespace OptimusPay.Data.Entities
-{
-    public class Deposit
-    {
-        public int Id { get; set; }
-        public decimal Amount { get; set; }
-        public string Status { get; set; }
-    }
-
-    public class Payout
-    {
-        public int Id { get; set; }
-        public decimal Amount { get; set; }
-        public string BankCode { get; set; }
-    }
-}
-'''
-    chunks = chunker.chunk_file(csharp_code, "Deposit.cs", {"service": "Internal"})
-    print(f"C# chunks: {len(chunks)}")
-    for chunk in chunks:
-        print(f"  Chunk {chunk.index}/{chunk.total}: {len(chunk.content)} chars")
