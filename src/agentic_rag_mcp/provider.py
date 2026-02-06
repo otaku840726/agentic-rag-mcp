@@ -6,7 +6,7 @@ Provider — 統一的 LLM / Embedding client 工廠
 import os
 import re
 import yaml
-from pathlib import Path
+from importlib.resources import files
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
 
@@ -56,23 +56,17 @@ class ComponentConfig:
 _config_cache: Optional[Dict] = None
 
 
-def _get_config_path() -> Path:
-    """config.yaml 在 MCP 包目錄下"""
-    return Path(__file__).resolve().parent.parent.parent / "config.yaml"
-
-
 def load_config() -> Dict[str, Any]:
-    """讀取並快取 config.yaml（解析所有 ${ENV} 佔位符）"""
+    """讀取打包在 package 內的 config.yaml（解析所有 ${ENV} 佔位符）"""
     global _config_cache
     if _config_cache is not None:
         return _config_cache
 
-    config_path = _get_config_path()
-    if config_path.exists():
-        with open(config_path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
+    try:
+        config_text = files("agentic_rag_mcp").joinpath("config.yaml").read_text(encoding="utf-8")
+        raw = yaml.safe_load(config_text) or {}
         _config_cache = _resolve_dict(raw)
-    else:
+    except Exception:
         _config_cache = {}
     return _config_cache
 

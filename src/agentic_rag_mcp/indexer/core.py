@@ -59,9 +59,8 @@ class IndexerService:
     """通用 Codebase Indexer Service"""
 
     def __init__(self):
-        self._pkg_dir = Path(__file__).resolve().parent.parent.parent.parent
-        self.base_dir = self._pkg_dir.parent
-        self.state_path = self._pkg_dir / "index_state.json"
+        self.base_dir = Path.cwd()
+        self.state_path = self.base_dir / ".agentic-rag-index-state.json"
 
         self.state = self._load_state()
 
