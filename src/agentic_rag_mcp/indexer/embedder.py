@@ -88,8 +88,8 @@ class Embedder:
         effective_batch_size = batch_size if batch_size is not None else self.batch_size
         if texts_to_embed:
             for i in range(0, len(texts_to_embed), effective_batch_size):
-                batch = texts_to_embed[i:i + batch_size]
-                batch_indices = indices_to_embed[i:i + batch_size]
+                batch = texts_to_embed[i:i + effective_batch_size]
+                batch_indices = indices_to_embed[i:i + effective_batch_size]
 
                 response = self.client.embeddings.create(model=self.model, input=batch)
                 self.api_calls += 1
