@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "model": "qwen3-embedding:8b",
+  "entries": {
+    "40ea8b8d6124003a": {
+      "model": "qwen3-embedding:8b",
+      "dimension": 4096,
+      "metadata": {}
+    },
+    "49a6a235197bdacd": {
+      "model": "qwen3-embedding:8b",
+      "dimension": 4096,
+      "metadata": {}
+    }
+  }
+}

@@ -104,11 +104,17 @@ class IndexerService:
     # State
     # ------------------------------------------------------------------
 
+    def _get_embedding_model(self) -> str:
+        from ..provider import load_config
+        cfg = load_config()
+        return cfg.get("embedding", {}).get("model", "text-embedding-3-small")
+
     def _load_state(self) -> Dict:
         if self.state_path.exists():
             with open(self.state_path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        return {"files": {}, "last_full_index": None, "last_incremental_index": None}
+        return {"files": {}, "embedding_model": None,
+                "last_full_index": None, "last_incremental_index": None}
 
     def _save_state(self):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -235,8 +241,65 @@ class IndexerService:
             logger.error(f"Error indexing {file_path}: {e}")
             raise
 
-    def _ensure_collection(self):
-        self.qdrant.create_collection(dimension=self.embedder.get_dimension())
+    def _needs_recreate(self, current_model: str) -> Optional[str]:
+        """檢查是否需要重建 collection。
+
+        Returns:
+            需要重建的原因，或 None。
+        """
+        stored_model = self.state.get("embedding_model")
+
+        # 1) model 名稱變更
+        if stored_model and stored_model != current_model:
+            return f"model changed ({stored_model} -> {current_model})"
+
+        # 2) collection 已存在但 dimension 不匹配（legacy state 或手動建錯）
+        try:
+            info = self.qdrant.get_collection_info()
+            if "error" not in info:
+                cfg = info.get("config", {})
+                existing_dim = (cfg.get("dense", {}) or {}).get("size")
+                current_dim = self.embedder.get_dimension()
+                if existing_dim and existing_dim != current_dim:
+                    return (
+                        f"dimension mismatch (collection={existing_dim}, "
+                        f"model {current_model}={current_dim})"
+                    )
+        except Exception:
+            pass
+
+        return None
+
+    def _ensure_collection(self) -> Optional[str]:
+        """確保 collection 存在，並檢測 embedding model / dimension 變更。
+
+        Returns:
+            若重建，回傳警告訊息；否則 None。
+        """
+        current_model = self._get_embedding_model()
+        reason = self._needs_recreate(current_model)
+        warning = None
+
+        if reason:
+            logger.warning("Recreating collection: %s", reason)
+            self.qdrant.create_collection(
+                dimension=self.embedder.get_dimension(), recreate=True
+            )
+            self.state = {
+                "files": {},
+                "embedding_model": current_model,
+                "last_full_index": None,
+                "last_incremental_index": None,
+            }
+            self._save_state()
+            warning = f"Collection recreated ({reason}). All files will be re-indexed."
+        else:
+            self.qdrant.create_collection(dimension=self.embedder.get_dimension())
+            if not self.state.get("embedding_model"):
+                self.state["embedding_model"] = current_model
+                self._save_state()
+
+        return warning
 
     # ==================================================================
     # Public MCP Tool Methods
@@ -249,7 +312,7 @@ class IndexerService:
             file_paths: 相對於 codebase root 的文件路徑列表
             metadata: 可選的額外 metadata，合併到自動推斷的 metadata
         """
-        self._ensure_collection()
+        warning = self._ensure_collection()
 
         results = []
         errors = []
@@ -274,12 +337,15 @@ class IndexerService:
 
         self._save_state()
 
-        return {
+        resp = {
             "files_indexed": len(results),
             "chunks_indexed": total_chunks,
             "results": results,
             "errors": errors,
         }
+        if warning:
+            resp["warning"] = warning
+        return resp
 
     def get_status(self) -> Dict[str, Any]:
         """查看索引狀態"""
@@ -293,6 +359,7 @@ class IndexerService:
             "qdrant": qdrant_stats,
             "local_state": {
                 "indexed_files": len(files_state),
+                "embedding_model": self.state.get("embedding_model"),
                 "last_full_index": self.state.get("last_full_index"),
                 "last_incremental_index": self.state.get("last_incremental_index"),
             },
@@ -308,7 +375,7 @@ class IndexerService:
             metadata: 可選的額外 metadata，合併到自動推斷的 metadata
             force: 強制重新索引
         """
-        self._ensure_collection()
+        warning = self._ensure_collection()
 
         matched = sorted(self.base_dir.glob(pattern))
 
@@ -343,7 +410,7 @@ class IndexerService:
         self.state["last_incremental_index"] = datetime.now().isoformat()
         self._save_state()
 
-        return {
+        resp = {
             "pattern": pattern,
             "files_found": len(matched),
             "files_indexed": files_indexed,
@@ -351,3 +418,6 @@ class IndexerService:
             "files_skipped": files_skipped,
             "errors": errors,
         }
+        if warning:
+            resp["warning"] = warning
+        return resp
