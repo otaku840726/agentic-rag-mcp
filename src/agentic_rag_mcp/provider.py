@@ -115,6 +115,8 @@ def create_client(provider: str) -> OpenAI:
     if not api_key:
         if provider == "openai":
             api_key = os.getenv("OPENAI_API_KEY", "")
+        elif provider == "openrouter":
+            api_key = os.getenv("OPENROUTER_API_KEY", "")
         elif provider == "gemini":
             api_key = os.getenv("GEMINI_API_KEY", "")
         elif provider == "local":
