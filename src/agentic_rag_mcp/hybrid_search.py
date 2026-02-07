@@ -20,7 +20,7 @@ from qdrant_client.http.models import (
 )
 import tiktoken
 
-from .provider import load_config, create_client, get_component_config
+from .provider import load_config, create_client, get_component_config, get_sparse_config
 
 
 @dataclass
@@ -60,7 +60,12 @@ class HybridSearch:
         self.openai = create_client(embed_cfg.provider)
         self.encoding = tiktoken.get_encoding("cl100k_base")
 
-        # Lazy-loaded sparse embedder
+        # Sparse mode from config
+        sparse_cfg = get_sparse_config()
+        self._sparse_mode = sparse_cfg["mode"]  # qdrant-bm25 | splade | disabled
+        self._sparse_cfg = sparse_cfg
+
+        # Lazy-loaded sparse encoder (Bm25Tokenizer or SparseTextEmbedding)
         self._sparse_embedder = None
         self._sparse_support = None  # None = not yet checked
 
@@ -68,6 +73,11 @@ class HybridSearch:
         """檢測 collection 是否有 sparse vectors (向後兼容)"""
         if self._sparse_support is not None:
             return self._sparse_support
+
+        # Mode explicitly disabled — skip collection check
+        if self._sparse_mode == "disabled":
+            self._sparse_support = False
+            return False
 
         try:
             info = self.qdrant.get_collection(self.config.collection_name)
@@ -79,21 +89,36 @@ class HybridSearch:
         return self._sparse_support
 
     def _get_sparse_embedder(self):
-        """Lazy-load sparse embedder (SPLADE++)"""
+        """Lazy-load sparse embedder based on mode."""
         if self._sparse_embedder is None:
-            from fastembed import SparseTextEmbedding
-            self._sparse_embedder = SparseTextEmbedding(model_name="prithivida/Splade_PP_en_v1")
+            if self._sparse_mode == "qdrant-bm25":
+                from .indexer.bm25_tokenizer import Bm25Tokenizer
+                vocab_size = int(self._sparse_cfg["bm25"].get("vocab_size", 30000))
+                self._sparse_embedder = Bm25Tokenizer(vocab_size=vocab_size)
+            elif self._sparse_mode == "splade":
+                from fastembed import SparseTextEmbedding
+                model_name = self._sparse_cfg["splade"].get("model", "prithivida/Splade_PP_en_v1")
+                self._sparse_embedder = SparseTextEmbedding(model_name=model_name)
+            # disabled → stays None
         return self._sparse_embedder
 
     def _sparse_embed_query(self, query: str) -> QdrantSparseVector:
-        """用 BM25 生成 sparse query vector"""
-        model = self._get_sparse_embedder()
-        results = list(model.embed([query]))
-        embedding = results[0]
-        return QdrantSparseVector(
-            indices=embedding.indices.tolist(),
-            values=embedding.values.tolist()
-        )
+        """Generate sparse query vector using the configured mode."""
+        embedder = self._get_sparse_embedder()
+        if embedder is None:
+            return QdrantSparseVector(indices=[], values=[])
+
+        if self._sparse_mode == "qdrant-bm25":
+            sv = embedder.embed_text(query)
+            return QdrantSparseVector(indices=sv.indices, values=sv.values)
+        else:
+            # SPLADE mode — fastembed SparseTextEmbedding
+            results = list(embedder.embed([query]))
+            embedding = results[0]
+            return QdrantSparseVector(
+                indices=embedding.indices.tolist(),
+                values=embedding.values.tolist(),
+            )
 
     def search(
         self,

@@ -13,6 +13,7 @@ from typing import List, Dict, Any, Optional
 
 from .embedder import Embedder
 from .sparse_embedder import SparseEmbedder
+from .bm25_tokenizer import Bm25Tokenizer
 from .chunker import Chunker
 from .qdrant_ops import QdrantOps
 
@@ -65,7 +66,8 @@ class IndexerService:
         self.state = self._load_state()
 
         self._embedder: Optional[Embedder] = None
-        self._sparse_embedder: Optional[SparseEmbedder] = None
+        self._sparse_encoder = None  # Bm25Tokenizer | SparseEmbedder | None
+        self._sparse_encoder_loaded = False
         self._chunker: Optional[Chunker] = None
         self._qdrant: Optional[QdrantOps] = None
 
@@ -80,10 +82,22 @@ class IndexerService:
         return self._embedder
 
     @property
-    def sparse_embedder(self) -> SparseEmbedder:
-        if self._sparse_embedder is None:
-            self._sparse_embedder = SparseEmbedder()
-        return self._sparse_embedder
+    def sparse_encoder(self):
+        """Return Bm25Tokenizer / SparseEmbedder / None based on sparse.mode."""
+        if not self._sparse_encoder_loaded:
+            from ..provider import get_sparse_config
+            sparse_cfg = get_sparse_config()
+            mode = sparse_cfg["mode"]
+            if mode == "qdrant-bm25":
+                vocab_size = int(sparse_cfg["bm25"].get("vocab_size", 30000))
+                self._sparse_encoder = Bm25Tokenizer(vocab_size=vocab_size)
+            elif mode == "splade":
+                model = sparse_cfg["splade"].get("model", "prithivida/Splade_PP_en_v1")
+                self._sparse_encoder = SparseEmbedder(model_name=model)
+            else:
+                self._sparse_encoder = None
+            self._sparse_encoder_loaded = True
+        return self._sparse_encoder
 
     @property
     def chunker(self) -> Chunker:
@@ -109,11 +123,15 @@ class IndexerService:
         cfg = load_config()
         return cfg.get("embedding", {}).get("model", "text-embedding-3-small")
 
+    def _get_sparse_mode(self) -> str:
+        from ..provider import get_sparse_config
+        return get_sparse_config()["mode"]
+
     def _load_state(self) -> Dict:
         if self.state_path.exists():
             with open(self.state_path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        return {"files": {}, "embedding_model": None,
+        return {"files": {}, "embedding_model": None, "sparse_mode": None,
                 "last_full_index": None, "last_incremental_index": None}
 
     def _save_state(self):
@@ -218,7 +236,11 @@ class IndexerService:
 
             texts = [chunk.content for chunk in chunks]
             embeddings = self.embedder.embed_batch(texts)
-            sparse_embeddings = self.sparse_embedder.embed_batch(texts)
+            sparse_embeddings = (
+                self.sparse_encoder.embed_batch(texts)
+                if self.sparse_encoder is not None
+                else None
+            )
 
             payloads = [
                 {**chunk.metadata, "content_preview": chunk.content[:500]}
@@ -253,7 +275,13 @@ class IndexerService:
         if stored_model and stored_model != current_model:
             return f"model changed ({stored_model} -> {current_model})"
 
-        # 2) collection 已存在但 dimension 不匹配（legacy state 或手動建錯）
+        # 2) sparse_mode 變更
+        current_sparse_mode = self._get_sparse_mode()
+        stored_sparse_mode = self.state.get("sparse_mode")
+        if stored_sparse_mode and stored_sparse_mode != current_sparse_mode:
+            return f"sparse_mode changed ({stored_sparse_mode} -> {current_sparse_mode})"
+
+        # 3) collection 已存在但 dimension 不匹配（legacy state 或手動建錯）
         try:
             info = self.qdrant.get_collection_info()
             if "error" not in info:
@@ -271,32 +299,45 @@ class IndexerService:
         return None
 
     def _ensure_collection(self) -> Optional[str]:
-        """確保 collection 存在，並檢測 embedding model / dimension 變更。
+        """確保 collection 存在，並檢測 embedding model / dimension / sparse_mode 變更。
 
         Returns:
             若重建，回傳警告訊息；否則 None。
         """
         current_model = self._get_embedding_model()
+        current_sparse_mode = self._get_sparse_mode()
         reason = self._needs_recreate(current_model)
         warning = None
 
         if reason:
             logger.warning("Recreating collection: %s", reason)
             self.qdrant.create_collection(
-                dimension=self.embedder.get_dimension(), recreate=True
+                dimension=self.embedder.get_dimension(),
+                recreate=True,
+                sparse_mode=current_sparse_mode,
             )
             self.state = {
                 "files": {},
                 "embedding_model": current_model,
+                "sparse_mode": current_sparse_mode,
                 "last_full_index": None,
                 "last_incremental_index": None,
             }
             self._save_state()
             warning = f"Collection recreated ({reason}). All files will be re-indexed."
         else:
-            self.qdrant.create_collection(dimension=self.embedder.get_dimension())
+            self.qdrant.create_collection(
+                dimension=self.embedder.get_dimension(),
+                sparse_mode=current_sparse_mode,
+            )
+            state_changed = False
             if not self.state.get("embedding_model"):
                 self.state["embedding_model"] = current_model
+                state_changed = True
+            if not self.state.get("sparse_mode"):
+                self.state["sparse_mode"] = current_sparse_mode
+                state_changed = True
+            if state_changed:
                 self._save_state()
 
         return warning

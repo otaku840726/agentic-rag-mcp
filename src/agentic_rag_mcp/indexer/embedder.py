@@ -14,11 +14,17 @@ class Embedder:
     """Embedding wrapper with caching — provider/model 從 config.yaml 讀取"""
 
     def __init__(self, use_cache: bool = True, cache_dir: str = None):
-        from ..provider import create_client, get_component_config
+        from ..provider import create_client, get_component_config, load_config
 
         cfg = get_component_config("embedding")
         self.client: OpenAI = create_client(cfg.provider)
         self.model: str = cfg.model
+
+        # Read batch_size from config (embedding.batch_size)
+        full_cfg = load_config()
+        self.batch_size: int = int(
+            full_cfg.get("embedding", {}).get("batch_size", 100)
+        )
 
         # dimension 首次 embed 時自動偵測
         self._dimension: Optional[int] = None
@@ -56,7 +62,7 @@ class Embedder:
 
         return embedding
 
-    def embed_batch(self, texts: List[str], batch_size: int = 100) -> List[List[float]]:
+    def embed_batch(self, texts: List[str], batch_size: int = None) -> List[List[float]]:
         """批量將文本轉換為向量"""
         if not texts:
             return []
@@ -79,8 +85,9 @@ class Embedder:
             texts_to_embed = texts
             indices_to_embed = list(range(len(texts)))
 
+        effective_batch_size = batch_size if batch_size is not None else self.batch_size
         if texts_to_embed:
-            for i in range(0, len(texts_to_embed), batch_size):
+            for i in range(0, len(texts_to_embed), effective_batch_size):
                 batch = texts_to_embed[i:i + batch_size]
                 batch_indices = indices_to_embed[i:i + batch_size]
 

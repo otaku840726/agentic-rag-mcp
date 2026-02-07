@@ -129,6 +129,23 @@ def create_client(provider: str) -> OpenAI:
     return OpenAI(**kwargs)
 
 
+def get_sparse_config() -> Dict[str, Any]:
+    """取得 sparse embedding 配置
+
+    Returns:
+        {"mode": "qdrant-bm25"|"splade"|"disabled",
+         "bm25": {"vocab_size": int},
+         "splade": {"model": str}}
+    """
+    cfg = load_config()
+    sparse = cfg.get("sparse", {})
+    return {
+        "mode": sparse.get("mode", "qdrant-bm25"),
+        "bm25": sparse.get("bm25", {"vocab_size": "30000"}),
+        "splade": sparse.get("splade", {"model": "prithivida/Splade_PP_en_v1"}),
+    }
+
+
 def create_client_for(component: str) -> tuple[OpenAI, ComponentConfig]:
     """一步取得 component 的 client + config
 

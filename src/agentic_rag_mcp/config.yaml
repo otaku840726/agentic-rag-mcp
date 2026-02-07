@@ -40,6 +40,14 @@ embedding:
   model: ${EMBEDDING_MODEL:-text-embedding-3-small}
   max_tokens: ${EMBEDDING_MAX_TOKENS:-512}
   dimension: 1536
+  batch_size: ${EMBEDDING_BATCH_SIZE:-100}
+
+sparse:
+  mode: ${SPARSE_MODE:-qdrant-bm25}   # qdrant-bm25 | splade | disabled
+  bm25:
+    vocab_size: ${BM25_VOCAB_SIZE:-30000}
+  splade:
+    model: ${SPLADE_MODEL:-prithivida/Splade_PP_en_v1}
 
 # Reranker (Cross-encoder, runs locally, no provider needed)
 reranker:

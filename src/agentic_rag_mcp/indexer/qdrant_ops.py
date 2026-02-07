@@ -11,6 +11,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.models import (
     Distance,
+    Modifier,
     VectorParams,
     SparseVectorParams,
     PointStruct,
@@ -50,12 +51,18 @@ class QdrantOps:
         else:
             self.client = QdrantClient(url=self.url)
 
-    def create_collection(self, dimension: int = 1536, recreate: bool = False) -> bool:
-        """創建 Collection (named vectors: dense + sparse)
+    def create_collection(
+        self,
+        dimension: int = 1536,
+        recreate: bool = False,
+        sparse_mode: str = "qdrant-bm25",
+    ) -> bool:
+        """創建 Collection (named vectors: dense + optional sparse)
 
         Args:
             dimension: Dense 向量維度
             recreate: 是否重新創建 (刪除現有)
+            sparse_mode: "qdrant-bm25" | "splade" | "disabled"
 
         Returns:
             是否成功
@@ -72,20 +79,35 @@ class QdrantOps:
                 print(f"Collection already exists: {self.collection_name}")
                 return True
 
-        # 創建新 collection with named vectors
-        self.client.create_collection(
-            collection_name=self.collection_name,
-            vectors_config={
-                "dense": VectorParams(
-                    size=dimension,
-                    distance=Distance.COSINE
-                )
-            },
-            sparse_vectors_config={
+        # Build sparse_vectors_config based on mode
+        sparse_vectors_config = None
+        if sparse_mode == "qdrant-bm25":
+            sparse_vectors_config = {
+                "sparse": SparseVectorParams(modifier=Modifier.IDF)
+            }
+        elif sparse_mode == "splade":
+            sparse_vectors_config = {
                 "sparse": SparseVectorParams()
             }
-        )
-        print(f"Created collection: {self.collection_name} (dense dim={dimension}, sparse=BM25)")
+        # disabled → no sparse_vectors_config
+
+        # 創建新 collection with named vectors
+        create_kwargs = {
+            "collection_name": self.collection_name,
+            "vectors_config": {
+                "dense": VectorParams(
+                    size=dimension,
+                    distance=Distance.COSINE,
+                )
+            },
+        }
+        if sparse_vectors_config is not None:
+            create_kwargs["sparse_vectors_config"] = sparse_vectors_config
+
+        self.client.create_collection(**create_kwargs)
+
+        sparse_label = sparse_mode if sparse_mode != "disabled" else "none"
+        print(f"Created collection: {self.collection_name} (dense dim={dimension}, sparse={sparse_label})")
 
         # 創建 payload indexes 用於過濾
         self._create_payload_indexes()
