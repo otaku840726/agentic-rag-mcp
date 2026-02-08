@@ -255,7 +255,7 @@ def detect_source_kind(path: str) -> str:
 # ========== Accept Patterns ==========
 ACCEPT_PATTERNS = {
     "config key": [r'\.timeout', r'\.ttl', r'config\[', r'@Value', r'Configuration\['],
-    "default value": [r'default\s*[:=]', r'fallback', r'\?\?', r'\|\|', r'??'],
+    "default value": [r'default\s*[:=]', r'fallback', r'\?\?', r'\|\|'],
     "where read": [r'GetValue', r'Configuration\[', r'@ConfigurationProperties', r'IOptions'],
     "enum definition": [r'enum\s+\w+', r'public\s+enum'],
     "transition": [r'transition', r'ChangeState', r'UpdateStatus', r'SetStatus'],
@@ -268,7 +268,7 @@ def check_accept_coverage(accept_items: List[str], content: str) -> List[str]:
     """檢查 accept 條件的覆蓋情況"""
     covered = []
     for item in accept_items:
-        patterns = ACCEPT_PATTERNS.get(item, [item])
+        patterns = ACCEPT_PATTERNS.get(item, [re.escape(item)])
         if any(re.search(p, content, re.IGNORECASE) for p in patterns):
             covered.append(item)
     return covered
