@@ -78,8 +78,8 @@ judge:
 # ============================================================
 budget:
   max_iterations: 5
-  max_tokens_per_round: 2000
-  total_token_budget: 15000
+  max_tokens_per_round: 32768
+  total_token_budget: 210000
   max_evidence_cards: 200
   working_set_size: 20
 
