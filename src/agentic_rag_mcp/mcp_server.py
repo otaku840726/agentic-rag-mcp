@@ -257,6 +257,14 @@ if MCP_AVAILABLE:
                     },
                     "required": ["pattern"]
                 }
+            ),
+            Tool(
+                name="debug-env",
+                description="Debug tool to check MCP server environment",
+                inputSchema={
+                    "type": "object",
+                    "properties": {}
+                }
             )
         ]
 
@@ -328,6 +336,18 @@ if MCP_AVAILABLE:
             svc = get_indexer_service()
             result = svc.index_by_pattern(pattern, metadata=metadata, force=force)
             return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
+
+        elif name == "debug-env":
+            import os
+            debug_info = {
+                "cwd": os.getcwd(),
+                "env": dict(os.environ),
+                "sys_path": sys.path if 'sys' in locals() else []
+            }
+            if 'sys' not in locals():
+                import sys
+                debug_info["sys_path"] = sys.path
+            return [TextContent(type="text", text=json.dumps(debug_info, indent=2))]
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
