@@ -61,9 +61,12 @@ class IndexerService:
 
     def __init__(self):
         self.base_dir = Path.cwd()
-        self.state_path = self.base_dir / ".agentic-rag-index-state.json"
+        # 移除本地 JSON 狀態文件，改用 Qdrant
+        # self.state_path = self.base_dir / ".agentic-rag-index-state.json"
+        # self.state = self._load_state()
 
-        self.state = self._load_state()
+        # 初始化 Qdrant state store（延遲初始化，在 qdrant property 中創建）
+        self._state_store = None
 
         self._embedder: Optional[Embedder] = None
         self._sparse_encoder = None  # Bm25Tokenizer | SparseEmbedder | None
@@ -113,6 +116,17 @@ class IndexerService:
         if self._qdrant is None:
             self._qdrant = QdrantOps()
         return self._qdrant
+    
+    @property
+    def state_store(self):
+        """Lazy load Qdrant state store"""
+        if self._state_store is None:
+            from .qdrant_state_store import QdrantStateStore
+            self._state_store = QdrantStateStore(
+                client=self.qdrant.client,
+                main_collection=self.qdrant.collection_name
+            )
+        return self._state_store
 
     # ------------------------------------------------------------------
     # State
@@ -127,17 +141,11 @@ class IndexerService:
         from ..provider import get_sparse_config
         return get_sparse_config()["mode"]
 
-    def _load_state(self) -> Dict:
-        if self.state_path.exists():
-            with open(self.state_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return {"files": {}, "embedding_model": None, "sparse_mode": None,
-                "last_full_index": None, "last_incremental_index": None}
-
-    def _save_state(self):
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.state_path, "w", encoding="utf-8") as f:
-            json.dump(self.state, f, indent=2, ensure_ascii=False, default=str)
+    # 移除 _load_state 和 _save_state，改用 QdrantStateStore
+    # def _load_state(self) -> Dict:
+    #     ...
+    # def _save_state(self):
+    #     ...
 
     # ------------------------------------------------------------------
     # Helpers
@@ -159,13 +167,16 @@ class IndexerService:
             return hasher.hexdigest()
 
     def _should_index_file(self, file_path: Path, force: bool = False) -> bool:
+        """檢查文件是否需要索引（使用 Qdrant 狀態）"""
         if force:
             return True
         rel_path = str(file_path.relative_to(self.base_dir))
         current_hash = self._get_file_hash(file_path)
-        if rel_path in self.state.get("files", {}):
-            if self.state["files"][rel_path].get("hash") == current_hash:
-                return False
+        
+        # 從 Qdrant 獲取文件狀態
+        file_state = self.state_store.get_file_state(rel_path)
+        if file_state and file_state.get("hash") == current_hash:
+            return False  # 文件未變，跳過
         return True
 
     def _is_excluded(self, file_path: Path) -> bool:
@@ -251,11 +262,12 @@ class IndexerService:
                 rel_path, embeddings, payloads, sparse_vectors=sparse_embeddings
             )
 
-            self.state["files"][rel_path] = {
-                "hash": self._get_file_hash(file_path),
-                "chunks": len(chunks),
-                "indexed_at": datetime.now().isoformat(),
-            }
+            # 保存狀態到 Qdrant
+            self.state_store.save_file_state(
+                file_path=rel_path,
+                file_hash=self._get_file_hash(file_path),
+                chunks=len(chunks)
+            )
 
             return len(chunks)
 
@@ -269,7 +281,9 @@ class IndexerService:
         Returns:
             需要重建的原因，或 None。
         """
-        stored_model = self.state.get("embedding_model")
+        # 從 Qdrant 獲取全局狀態
+        global_state = self.state_store.load_global_state() or {}
+        stored_model = global_state.get("embedding_model")
 
         # 1) model 名稱變更
         if stored_model and stored_model != current_model:
@@ -277,7 +291,7 @@ class IndexerService:
 
         # 2) sparse_mode 變更
         current_sparse_mode = self._get_sparse_mode()
-        stored_sparse_mode = self.state.get("sparse_mode")
+        stored_sparse_mode = global_state.get("sparse_mode")
         if stored_sparse_mode and stored_sparse_mode != current_sparse_mode:
             return f"sparse_mode changed ({stored_sparse_mode} -> {current_sparse_mode})"
 
@@ -316,29 +330,24 @@ class IndexerService:
                 recreate=True,
                 sparse_mode=current_sparse_mode,
             )
-            self.state = {
-                "files": {},
-                "embedding_model": current_model,
-                "sparse_mode": current_sparse_mode,
-                "last_full_index": None,
-                "last_incremental_index": None,
-            }
-            self._save_state()
+            # 重建後，保存新的全局狀態到 Qdrant
+            self.state_store.save_global_state(
+                embedding_model=current_model,
+                sparse_mode=current_sparse_mode
+            )
             warning = f"Collection recreated ({reason}). All files will be re-indexed."
-        else:
+            # 確保 collection 存在
             self.qdrant.create_collection(
                 dimension=self.embedder.get_dimension(),
                 sparse_mode=current_sparse_mode,
             )
-            state_changed = False
-            if not self.state.get("embedding_model"):
-                self.state["embedding_model"] = current_model
-                state_changed = True
-            if not self.state.get("sparse_mode"):
-                self.state["sparse_mode"] = current_sparse_mode
-                state_changed = True
-            if state_changed:
-                self._save_state()
+            # 保存全局狀態到 Qdrant（如果還沒有）
+            global_state = self.state_store.load_global_state()
+            if not global_state or not global_state.get("embedding_model"):
+                self.state_store.save_global_state(
+                    embedding_model=current_model,
+                    sparse_mode=current_sparse_mode
+                )
 
         return warning
 
@@ -376,7 +385,8 @@ class IndexerService:
             except Exception as e:
                 errors.append({"file": rel, "error": str(e)})
 
-        self._save_state()
+        # 更新最後索引時間
+        self.state_store.update_last_index_time()
 
         resp = {
             "files_indexed": len(results),
@@ -389,20 +399,22 @@ class IndexerService:
         return resp
 
     def get_status(self) -> Dict[str, Any]:
-        """查看索引狀態"""
+        """查看索引狀態（使用 Qdrant 狀態）"""
         try:
             qdrant_stats = self.qdrant.get_stats()
         except Exception as e:
             qdrant_stats = {"error": str(e)}
 
-        files_state = self.state.get("files", {})
+        # 從 Qdrant 獲取全局狀態和文件計數
+        global_state = self.state_store.load_global_state() or {}
+        indexed_files_count = self.state_store.count_indexed_files()
+        
         return {
             "qdrant": qdrant_stats,
             "local_state": {
-                "indexed_files": len(files_state),
-                "embedding_model": self.state.get("embedding_model"),
-                "last_full_index": self.state.get("last_full_index"),
-                "last_incremental_index": self.state.get("last_incremental_index"),
+                "indexed_files": indexed_files_count,
+                "embedding_model": global_state.get("embedding_model"),
+                "last_index_time": global_state.get("last_index_time"),
             },
         }
 
@@ -448,8 +460,8 @@ class IndexerService:
             except Exception as e:
                 errors.append({"file": rel_path, "error": str(e)})
 
-        self.state["last_incremental_index"] = datetime.now().isoformat()
-        self._save_state()
+        # 更新最後索引時間
+        self.state_store.update_last_index_time()
 
         resp = {
             "pattern": pattern,

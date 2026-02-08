@@ -1,21 +1,55 @@
 # Agentic RAG MCP Server
 
-Agentic RAG search for any codebase — multi-hop retrieval with hybrid search, cross-encoder reranking, and iterative query planning.
+A powerful Model Context Protocol (MCP) server that provides **agentic retrieval-augmented generation (RAG)** capabilities for your codebase. This server enables AI assistants to intelligently search, analyze, and retrieve relevant code context using advanced hybrid search and multi-hop reasoning.
 
-## Features
+## 🌟 Key Features
 
-- **Multi-hop Search** — iterative search that automatically traces logic across files
-- **Hybrid Search** — dense (semantic) + sparse (BM25) with RRF fusion via Qdrant
-- **Cross-encoder Reranking** — local cross-encoder model for precision re-ranking
-- **Evidence Store** — two-tier evidence management (full pool + diversity working set)
-- **Incremental Indexing** — hash-based change detection, only re-indexes modified files
-- **Model Mismatch Detection** — auto-recreates collection when embedding model changes
-- **Multi-Provider** — OpenAI, OpenRouter, Gemini, local LLM (Ollama/vLLM/LM Studio)
-- **Per-Component Config** — mix providers freely (e.g. embedding=openrouter, planner=local)
+### Intelligent Search
+- **Hybrid Search**: Combines semantic (dense vectors) and keyword (BM25/FastEmbed sparse) search for optimal retrieval
+- **Agentic Multi-Hop Search**: Iterative query planning and evidence synthesis for complex questions
+- **Cross-Encoder Reranking**: Improves result relevance with state-of-the-art reranking models
 
-## Quick Start
+### Stateless Architecture
+- **Qdrant-Based State Management**: All index state stored in Qdrant collections (no local files)
+- **Distributed-Ready**: Multiple instances can share the same index state
+- **Scalable**: No JSON file size limitations, handles large codebases efficiently
 
-### 1. Add to `.mcp.json`
+### Flexible Configuration
+- **Multiple Embedding Providers**: OpenAI, local models (via Ollama), Hugging Face
+- **Customizable Chunking**: Adaptive chunking strategies for different file types
+- **Incremental Indexing**: Only re-index changed files based on content hashing
+
+## 🏗️ Architecture
+
+```mermaid
+graph TB
+    subgraph "MCP Server"
+        A[MCP Tools] --> B[IndexerService]
+        A --> C[SearchService]
+    end
+    
+    subgraph "State Management"
+        B --> D[QdrantStateStore]
+        D --> E[State Collection<br/>payload-only]
+    end
+    
+    subgraph "Index Storage"
+        B --> F[Main Collection<br/>vectors + payload]
+        C --> F
+    end
+    
+    E -.->|File States| G[file paths, hashes, chunks]
+    E -.->|Global Config| H[model, sparse mode, timestamps]
+    F -.->|Indexed Data| I[embeddings, metadata, content]
+```
+
+## 📦 Installation
+
+This MCP server is designed to be installed as an **external MCP server** via `uvx`. No manual cloning required.
+
+### Quick Start
+
+Add to your MCP client configuration (e.g., Claude Desktop's `claude_desktop_config.json`):
 
 ```json
 {
@@ -39,68 +73,62 @@ Agentic RAG search for any codebase — multi-hop retrieval with hybrid search, 
 }
 ```
 
-### 2. Index your codebase
+> **Note**: Replace `your-org` with the actual GitHub organization/username where this repo is published.
 
-Use the `index-by-pattern` tool in Claude Code:
+## 🔧 Configuration
 
-```
-index-by-pattern("**/*.cs")
-index-by-pattern("docs/**/*.md")
-index-by-pattern("knowledge/**/*.yaml")
-```
+All configuration is done via **environment variables** in your MCP client configuration. Each component can use different providers.
 
-### 3. Search
+### Required Environment Variables
 
-```
-agentic-search("How does the deposit flow work?")
-quick-search("DepositService")
-```
-
-## Configuration
-
-All configuration is done via **environment variables** in `.mcp.json`. The bundled `config.yaml` provides sensible defaults; env vars override them.
-
-### Required
-
-| Env Var | Description |
-|---------|-------------|
+| Variable | Description |
+|----------|-------------|
 | `QDRANT_URL` | Qdrant Cloud or self-hosted URL |
 | `QDRANT_API_KEY` | Qdrant API key |
-| `QDRANT_COLLECTION` | Collection name |
+| `QDRANT_COLLECTION` | Collection name for your codebase |
 
-Plus at least one provider API key (see below).
+Plus at least one provider API key (see examples below).
 
-### Providers
+### Provider Options
 
-All providers use OpenAI-compatible API format. Only configure the ones you use.
+All providers use OpenAI-compatible API format:
 
-| Provider | Env Vars |
-|----------|----------|
-| **openai** | `OPENAI_API_KEY` |
-| **openrouter** | `OPENROUTER_API_KEY` |
-| **gemini** | `GEMINI_API_KEY` |
-| **local** (Ollama/vLLM/LM Studio) | `LOCAL_LLM_URL`, `LOCAL_LLM_API_KEY` (optional) |
+- **openai**: `OPENAI_API_KEY`
+- **openrouter**: `OPENROUTER_API_KEY`
+- **gemini**: `GEMINI_API_KEY`
+- **local** (Ollama/vLLM/LM Studio): `LOCAL_LLM_URL`, `LOCAL_LLM_API_KEY` (optional)
 
-### Component Overrides
+### Component Configuration
 
-Each component (embedding, planner, synthesizer, judge) can independently use any provider and model. Defaults: `openai` + `gpt-4o-mini`.
+Each component can independently use any provider:
 
-| Env Var | Default | Description |
-|---------|---------|-------------|
-| `EMBEDDING_PROVIDER` | `openai` | Provider for embeddings |
-| `EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model name |
-| `EMBEDDING_MAX_TOKENS` | `8191` | Max tokens per chunk (auto-split with tiktoken) |
-| `PLANNER_PROVIDER` | `openai` | Provider for query planner |
-| `PLANNER_MODEL` | `gpt-4o-mini` | Planner model |
-| `SYNTHESIZER_PROVIDER` | `openai` | Provider for answer synthesizer |
-| `SYNTHESIZER_MODEL` | `gpt-4o-mini` | Synthesizer model |
-| `JUDGE_PROVIDER` | `openai` | Provider for satisfaction judge |
-| `JUDGE_MODEL` | `gpt-4o-mini` | Judge model |
+| Component | Provider Env | Model Env | Default Model |
+|-----------|--------------|-----------|---------------|
+| Embedding | `EMBEDDING_PROVIDER` | `EMBEDDING_MODEL` | `text-embedding-3-small` |
+| Planner | `PLANNER_PROVIDER` | `PLANNER_MODEL` | `gpt-4o-mini` |
+| Synthesizer | `SYNTHESIZER_PROVIDER` | `SYNTHESIZER_MODEL` | `gpt-4o-mini` |
+| Judge | `JUDGE_PROVIDER` | `JUDGE_MODEL` | `gpt-4o-mini` |
 
-### Example: All Local
+### Configuration Examples
 
+#### Example 1: All OpenAI (Recommended for best quality)
 ```json
 "env": {
+  "QDRANT_URL": "https://xxx.cloud.qdrant.io",
+  "QDRANT_API_KEY": "your-key",
+  "QDRANT_COLLECTION": "my-codebase",
+  "OPENAI_API_KEY": "sk-...",
+  "EMBEDDING_PROVIDER": "openai",
+  "EMBEDDING_MODEL": "text-embedding-3-small"
+}
+```
+
+#### Example 2: All Local with Ollama (Privacy-focused, free)
+```json
+"env": {
+  "QDRANT_URL": "https://xxx.cloud.qdrant.io",
+  "QDRANT_API_KEY": "your-key",
+  "QDRANT_COLLECTION": "my-codebase",
   "LOCAL_LLM_URL": "http://127.0.0.1:11434/v1",
   "EMBEDDING_PROVIDER": "local",
   "EMBEDDING_MODEL": "qwen3-embedding:4b",
@@ -114,10 +142,12 @@ Each component (embedding, planner, synthesizer, judge) can independently use an
 }
 ```
 
-### Example: Mixed (OpenRouter embedding + local LLM)
-
+#### Example 3: Mixed Providers (OpenRouter embedding + Local LLMs)
 ```json
 "env": {
+  "QDRANT_URL": "https://xxx.cloud.qdrant.io",
+  "QDRANT_API_KEY": "your-key",
+  "QDRANT_COLLECTION": "my-codebase",
   "OPENROUTER_API_KEY": "sk-or-v1-...",
   "LOCAL_LLM_URL": "http://127.0.0.1:11434/v1",
   "EMBEDDING_PROVIDER": "openrouter",
@@ -131,125 +161,218 @@ Each component (embedding, planner, synthesizer, judge) can independently use an
 }
 ```
 
-## MCP Tools
+## 🚀 Usage
 
-### `agentic-search`
+### Available MCP Tools
 
-Multi-hop agentic search — iterates until the answer is complete.
-
-| Parameter | Required | Default | Description |
-|-----------|----------|---------|-------------|
-| `query` | Yes | — | Natural language query |
-| `max_iterations` | No | 5 | Max search iterations |
-
-### `quick-search`
-
-Single-pass search for simple lookups.
-
-| Parameter | Required | Default | Description |
-|-----------|----------|---------|-------------|
-| `query` | Yes | — | Search query |
-| `operator` | No | `hybrid` | `hybrid` / `semantic` / `keyword` / `exact` |
-| `top_k` | No | 10 | Number of results |
-
-### `index-files`
-
-Index specific files. Auto-infers metadata from file paths.
-
-| Parameter | Required | Default | Description |
-|-----------|----------|---------|-------------|
-| `file_paths` | Yes | — | File paths relative to codebase root |
-| `metadata` | No | — | Extra metadata to merge |
-
-### `index-status`
-
-Show current index status: Qdrant stats, embedding model, file counts.
-
-### `index-by-pattern`
-
-Batch index by glob pattern. Incremental — skips unchanged files.
-
-| Parameter | Required | Default | Description |
-|-----------|----------|---------|-------------|
-| `pattern` | Yes | — | Glob pattern (e.g. `**/*.cs`) |
-| `metadata` | No | — | Extra metadata to merge |
-| `force` | No | `false` | Force re-index unchanged files |
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                       MCP Server                          │
-├──────────────────────────────────────────────────────────┤
-│                                                           │
-│  ┌──────────┐    ┌──────────────┐    ┌────────────────┐  │
-│  │ Planner  │───>│ Query Builder│───>│ Hybrid Search  │  │
-│  │ (LLM)    │    └──────────────┘    │ (Qdrant)       │  │
-│  └──────────┘                        └────────────────┘  │
-│       │                                     │            │
-│       │                              ┌──────────────┐    │
-│       │                              │ Reranker     │    │
-│       │                              │ (CrossEnc)   │    │
-│       │                              └──────────────┘    │
-│       │                                     │            │
-│       v                                     v            │
-│  ┌───────────────────────────────────────────────────┐   │
-│  │              Evidence Store                        │   │
-│  │         Pool + Diversity Working Set               │   │
-│  └───────────────────────────────────────────────────┘   │
-│                          │                                │
-│                          v                                │
-│  ┌───────────────────────────────────────────────────┐   │
-│  │           Synthesizer (LLM)                        │   │
-│  └───────────────────────────────────────────────────┘   │
-│                                                           │
-│  ┌───────────────────────────────────────────────────┐   │
-│  │           Indexer (embed + upsert to Qdrant)       │   │
-│  └───────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────┘
+#### 1. `index-files`
+Index specific files into Qdrant:
+```python
+# The AI can call:
+index-files(
+    file_paths=["src/main.py", "src/utils.py"],
+    metadata={"category": "core"}
+)
 ```
 
-## Modules
+####2. `index-by-pattern`
+Batch index files matching a glob pattern:
+```python
+# Examples:
+index-by-pattern(pattern="src/**/*.py")
+index-by-pattern(pattern="docs/**/*.md", force=True)
+```
 
-| Module | Description |
-|--------|-------------|
-| `mcp_server.py` | MCP server entry point, tool registration |
-| `provider.py` | Unified LLM/embedding client factory |
-| `agentic_search.py` | Main agentic loop controller |
-| `planner.py` | Planner + Judge LLM |
-| `synthesizer.py` | Answer synthesizer LLM |
-| `hybrid_search.py` | Dense + sparse hybrid search engine |
-| `reranker.py` | Cross-encoder reranking |
-| `evidence_store.py` | Two-tier evidence management |
-| `query_builder.py` | Query templates and builder |
-| `budget.py` | Token budget and quality gate |
-| `models.py` | Data structures |
-| `indexer/` | Indexing subpackage (chunker, embedder, qdrant ops) |
+#### 3. `agentic-search`
+Multi-hop intelligent search with reasoning:
+```python
+agentic-search(
+    query="How does the authentication flow work?",
+    max_iterations=5
+)
+```
 
-## Embedding Model Change
+#### 4. `quick-search`
+Fast single-pass search:
+```python
+quick-search(
+    query="find UserService class",
+    operator="hybrid",  # hybrid, semantic, keyword, exact
+    top_k=10
+)
+```
 
-When you change `EMBEDDING_MODEL`, the server automatically:
-1. Detects model name or dimension mismatch
-2. Recreates the Qdrant collection
-3. Clears the index state
-4. Returns a warning in the next index response
+#### 5. `index-status`
+Check current index status:
+```python
+index-status()
+# Returns: indexed_files, points_count, embedding_model, last_index_time
+```
 
-All files will need to be re-indexed after a model change.
+### State Management
 
-## Development
+All index state is stored in Qdrant in a dedicated state collection (`{collection-name}-state`):
+
+- **File States**: Path, content hash, chunk count, index timestamp
+- **Global Config**: Embedding model, sparse mode, last index time
+- **No Local Files**: No `.agentic-rag-index-state.json` required
+
+This enables:
+- ✅ Distributed indexing across multiple instances
+- ✅ Automatic state synchronization
+- ✅ No file system dependencies
+- ✅ Scalable to millions of files
+
+### Sparse Encoding Modes
+
+Control keyword search behavior:
+
+- `bm25` (default): Traditional BM25 algorithm
+- `fastembed`: FastEmbed sparse embeddings
+- `none`: Disable sparse search (semantic only)
+
+Set via environment variable:
+```json
+"SPARSE_MODE": "bm25"
+```
+
+### Chunking Strategy
+
+Files are chunked adaptively based on file type:
+- **Code files**: AST-aware chunking preserving function/class boundaries
+- **Markdown**: Section-based chunking
+- **Plain text**: Sliding window with overlap
+
+Default: 500 tokens per chunk, 50 token overlap
+
+## 🧪 Development & Testing
+
+### For Contributors
+
+If you want to develop locally:
 
 ```bash
 git clone https://github.com/your-org/agentic-rag-mcp.git
 cd agentic-rag-mcp
 python -m venv venv
-source venv/bin/activate
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -e ".[dev]"
-
-pytest
-black src/
-ruff check src/ --fix
 ```
 
-## License
+### Run Tests
+
+```bash
+# Syntax check
+python check_syntax.py
+
+# Functional tests (uses test collection)
+python test_qdrant_state.py
+
+# Unit tests
+pytest
+```
+
+## 📊 Monitoring
+
+### Check Index Status
+
+Use the `index-status` tool:
+```python
+index-status()
+```
+
+Returns:
+```json
+{
+  "indexed_files": 1247,
+  "points_count": 5438,
+  "embedding_model": "text-embedding-3-small",
+  "sparse_mode": "bm25",
+  "last_index_time": "2026-02-08T09:20:52.241095"
+}
+```
+
+### Qdrant Dashboard
+
+- **Cloud**: https://cloud.qdrant.io
+- **Local**: http://localhost:6333/dashboard
+
+## 🛠️ Troubleshooting
+
+### Connection Issues
+
+**Problem**: Cannot connect to Qdrant
+```
+Error: Connection refused
+```
+
+**Solution**: Verify Qdrant URL and API key:
+```bash
+# Test connection
+curl -H "api-key: $QDRANT_API_KEY" "$QDRANT_URL/collections"
+```
+
+### State Collection Not Found
+
+**Problem**: State collection doesn't exist
+```
+Collection 'xxx-state' not found
+```
+
+**Solution**: State collection is auto-created on first use. Run `index-files` once:
+```python
+index-files(file_paths=["README.md"])
+```
+
+### Indexing Hangs
+
+**Problem**: Indexing takes too long or hangs
+
+**Possible causes**:
+- Large files (>1MB): Chunking may be slow
+- Network issues: Check Qdrant connection
+- Embedding API rate limits: Reduce batch size
+
+**Solution**:
+```json
+"EMBEDDING_BATCH_SIZE": "4"
+```
+
+### Memory Issues
+
+**Problem**: Out of memory errors
+
+**Solution**: Qdrant's on-disk payload is enabled by default. For very large codebases, consider using a larger Qdrant instance.
+
+## 🔄 Migration from Local State
+
+If you previously used a version with local `index_state.json`:
+
+1. **The state is now in Qdrant**: All file states and config are stored in `{collection}-state` collection
+2. **Old JSON files are ignored**: The server no longer reads `.agentic-rag-index-state.json`
+3. **Re-indexing**: Simply run `index-by-pattern` again - it will detect unchanged files and skip them
+
+## 🤝 Contributing
+
+Contributions welcome! Areas for improvement:
+
+- [ ] Additional embedding provider support
+- [ ] Performance benchmarks
+- [ ] Web UI for index management
+- [ ] Advanced chunking strategies
+
+## 📝 License
 
 MIT
+
+## 🙏 Acknowledgments
+
+Built with:
+- [MCP](https://github.com/anthropics/mcp) - Model Context Protocol
+- [Qdrant](https://qdrant.tech) - Vector database
+- [Sentence Transformers](https://www.sbert.net) - Embedding models
+- [FastEmbed](https://github.com/qdrant/fastembed) - Lightweight embeddings
+
+---
+
+**Questions?** Open an issue on GitHub.
