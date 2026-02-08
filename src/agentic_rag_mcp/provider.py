@@ -82,8 +82,8 @@ def get_component_config(component: str) -> ComponentConfig:
     return ComponentConfig(
         provider=comp.get("provider", "openai"),
         model=comp.get("model", "gpt-4o-mini"),
-        max_tokens=comp.get("max_tokens", 4000),
-        temperature=comp.get("temperature", 0.1),
+        max_tokens=int(comp.get("max_tokens", 4000)),
+        temperature=float(comp.get("temperature", 0.1)),
     )
 
 

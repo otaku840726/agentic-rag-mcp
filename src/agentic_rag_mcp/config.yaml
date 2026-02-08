@@ -58,20 +58,20 @@ reranker:
 planner:
   provider: ${PLANNER_PROVIDER:-openai}
   model: ${PLANNER_MODEL:-gpt-4o-mini}
-  max_tokens: 1000
-  temperature: 0.1
+  max_tokens: ${PLANNER_MAX_TOKENS:-4000}
+  temperature: ${PLANNER_TEMPERATURE:-0.1}
 
 synthesizer:
   provider: ${SYNTHESIZER_PROVIDER:-openai}
   model: ${SYNTHESIZER_MODEL:-gpt-4o-mini}
-  max_tokens: 2000
-  temperature: 0.2
+  max_tokens: ${SYNTHESIZER_MAX_TOKENS:-2000}
+  temperature: ${SYNTHESIZER_TEMPERATURE:-0.2}
 
 judge:
   provider: ${JUDGE_PROVIDER:-openai}
   model: ${JUDGE_MODEL:-gpt-4o-mini}
-  max_tokens: 100
-  temperature: 0
+  max_tokens: ${JUDGE_MAX_TOKENS:-1000}
+  temperature: ${JUDGE_TEMPERATURE:-0}
 
 # ============================================================
 # Budget & Quality
