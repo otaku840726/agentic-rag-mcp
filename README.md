@@ -83,6 +83,7 @@ All configuration is done via **environment variables** in your MCP client confi
 
 | Variable | Description |
 |----------|-------------|
+| `CODEBASE_ROOT` | Absolute path to your codebase root directory (required for indexing) |
 | `QDRANT_URL` | Qdrant Cloud or self-hosted URL |
 | `QDRANT_API_KEY` | Qdrant API key |
 | `QDRANT_COLLECTION` | Collection name for your codebase |
