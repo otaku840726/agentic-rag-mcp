@@ -468,6 +468,7 @@ class IndexerService:
 
         resp = {
             "pattern": pattern,
+            "base_dir": str(self.base_dir),  # Debug: show actual working directory
             "files_found": len(matched),
             "files_indexed": files_indexed,
             "chunks_indexed": chunks_indexed,
