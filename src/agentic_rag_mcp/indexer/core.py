@@ -61,14 +61,8 @@ class IndexerService:
     """通用 Codebase Indexer Service"""
 
     def __init__(self):
-        # 從環境變量讀取代碼庫根目錄，如果未設置則使用當前工作目錄
-        codebase_root = os.getenv("CODEBASE_ROOT")
-        if codebase_root:
-            self.base_dir = Path(codebase_root).resolve()
-            logger.info(f"Using CODEBASE_ROOT from environment: {self.base_dir}")
-        else:
-            self.base_dir = Path.cwd()
-            logger.info(f"Using current working directory: {self.base_dir}")
+        self.base_dir = Path.cwd()
+        logger.info(f"IndexerService initialized with base_dir: {self.base_dir}")
         
         # 移除本地 JSON 狀態文件，改用 Qdrant
         # self.state_path = self.base_dir / ".agentic-rag-index-state.json"

@@ -22,12 +22,7 @@ class EmbeddingCache:
         if cache_dir:
             self.cache_dir = Path(cache_dir)
         else:
-            # 優先使用 CODEBASE_ROOT，否則使用當前工作目錄
-            codebase_root = os.getenv("CODEBASE_ROOT")
-            if codebase_root:
-                self.cache_dir = Path(codebase_root) / ".agentic-rag-cache" / "embeddings"
-            else:
-                self.cache_dir = Path.cwd() / ".agentic-rag-cache" / "embeddings"
+            self.cache_dir = Path.cwd() / ".agentic-rag-cache" / "embeddings"
         
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
