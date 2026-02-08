@@ -339,18 +339,19 @@ class IndexerService:
                 sparse_mode=current_sparse_mode
             )
             warning = f"Collection recreated ({reason}). All files will be re-indexed."
-            # 確保 collection 存在
-            self.qdrant.create_collection(
-                dimension=self.embedder.get_dimension(),
-                sparse_mode=current_sparse_mode,
+
+        # 確保 collection 存在（首次使用時創建）
+        self.qdrant.create_collection(
+            dimension=self.embedder.get_dimension(),
+            sparse_mode=current_sparse_mode,
+        )
+        # 保存全局狀態到 Qdrant（如果還沒有）
+        global_state = self.state_store.load_global_state()
+        if not global_state or not global_state.get("embedding_model"):
+            self.state_store.save_global_state(
+                embedding_model=current_model,
+                sparse_mode=current_sparse_mode
             )
-            # 保存全局狀態到 Qdrant（如果還沒有）
-            global_state = self.state_store.load_global_state()
-            if not global_state or not global_state.get("embedding_model"):
-                self.state_store.save_global_state(
-                    embedding_model=current_model,
-                    sparse_mode=current_sparse_mode
-                )
 
         return warning
 
