@@ -3,9 +3,13 @@ Embedding 模組
 負責將文本轉換為向量，支持任意 OpenAI-compatible provider
 """
 
+import logging
+import time
 from typing import List, Optional
 
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
+
+logger = logging.getLogger(__name__)
 
 from .embedding_cache import EmbeddingCache
 
@@ -51,7 +55,7 @@ class Embedder:
                 self.cached_results += 1
                 return cached
 
-        response = self.client.embeddings.create(model=self.model, input=text)
+        response = self._embed_with_retry([text])
         embedding = response.data[0].embedding
         self.api_calls += 1
 
@@ -92,7 +96,7 @@ class Embedder:
                 batch = texts_to_embed[i:i + effective_batch_size]
                 batch_indices = indices_to_embed[i:i + effective_batch_size]
 
-                response = self.client.embeddings.create(model=self.model, input=batch)
+                response = self._embed_with_retry(batch)
                 self.api_calls += 1
 
                 for j, item in enumerate(response.data):
@@ -110,6 +114,19 @@ class Embedder:
                 self.cache.save()
 
         return all_embeddings
+
+    def _embed_with_retry(self, texts: List[str], max_retries: int = 5):
+        """Call embeddings API with exponential backoff on 429 rate limit errors."""
+        wait = 10
+        for attempt in range(max_retries):
+            try:
+                return self.client.embeddings.create(model=self.model, input=texts)
+            except RateLimitError as e:
+                if attempt == max_retries - 1:
+                    raise
+                logger.warning(f"Rate limit hit, retrying in {wait}s (attempt {attempt + 1}/{max_retries}): {e}")
+                time.sleep(wait)
+                wait = min(wait * 2, 120)
 
     def get_stats(self) -> dict:
         return {

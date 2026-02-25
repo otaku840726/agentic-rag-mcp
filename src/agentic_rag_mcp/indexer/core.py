@@ -1013,8 +1013,14 @@ class IndexerService:
 
         indexed = 0
         errors: List[Dict] = []
+        total_files = len(changed_files)
+        log_interval = max(1, min(100, total_files // 10))
 
-        for rel_path in sorted(changed_files):
+        logger.info(f"Pipeline A starting: {total_files} files to index")
+        for file_num, rel_path in enumerate(sorted(changed_files), 1):
+            if file_num % log_interval == 0 or file_num == total_files:
+                logger.info(f"Pipeline A progress: {file_num}/{total_files} files processed, {indexed} chunks indexed so far")
+
             abs_path = dir_path / rel_path if not Path(rel_path).is_absolute() else Path(rel_path)
             if not abs_path.exists():
                 abs_path = self.base_dir / rel_path
