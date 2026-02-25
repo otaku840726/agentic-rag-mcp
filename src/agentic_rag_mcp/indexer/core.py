@@ -7,6 +7,7 @@ IndexerService — 通用索引服務
 import hashlib
 import json
 import os
+import re
 import concurrent.futures
 
 import logging
@@ -821,6 +822,12 @@ class IndexerService:
         for pattern in get_excluded_filename_patterns():
             if fname.endswith(pattern):
                 return True
+
+        # 2b. Content-hash named build artifacts (e.g. main.87f9f66e.css, 415.c8ae0361.chunk.js)
+        #     Pattern: any segment is 6-20 hex chars (webpack/vite content hash)
+        stem = file_path.stem  # filename without final extension
+        if re.search(r'(?:^|\.)[a-f0-9]{6,20}(?:\.|$)', stem):
+            return True
 
         # 3. Whitelist: extension OR exact filename
         ext = file_path.suffix.lower()
