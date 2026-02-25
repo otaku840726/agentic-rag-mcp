@@ -156,8 +156,11 @@ public class SpoonAnalyzer {
         }
 
         // Bug 3 fix: Constructors → symbols + MEMBER_OF + CALLS + USES_TYPE
-        for (CtConstructor<?> ctor : type.getConstructors()) {
-            processConstructor(ctor, fqn, filePath, symbols, relationships, seen, type);
+        // getConstructors() is only available on CtClass, not CtType base interface
+        if (type instanceof CtClass<?> ctClassForCtors) {
+            for (CtConstructor<?> ctor : ctClassForCtors.getConstructors()) {
+                processConstructor(ctor, fqn, filePath, symbols, relationships, seen, type);
+            }
         }
 
         // Bug 2 fix: Fields → symbols + MEMBER_OF + USES_TYPE
