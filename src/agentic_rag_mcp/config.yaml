@@ -1,0 +1,171 @@
+# Agentic RAG MCP Server Configuration
+#
+# All values can be overridden via environment variables.
+# In MCP, set env vars in .mcp.json:
+#   "env": { "PLANNER_PROVIDER": "local", "PLANNER_MODEL": "qwen2.5-coder-14b" }
+
+# ============================================================
+# Providers (OpenAI-compatible API format)
+# Credentials are resolved from env vars at runtime.
+# Only the providers you actually use need valid credentials.
+# ============================================================
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+  local:
+    base_url: ${LOCAL_LLM_URL:-http://127.0.0.1:1234/v1}
+    api_key: ${LOCAL_LLM_API_KEY:-not-needed}
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY}
+  # Google AI Studio (Personal/Prototyping) - API Key based
+  gemini:
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+    api_key: ${GEMINI_API_KEY}
+
+  # Voyage AI - Specialized embedding models (voyage-code-3, voyage-3, etc.)
+  voyage:
+    base_url: https://api.voyageai.com/v1
+    api_key: ${VOYAGE_API_KEY}
+
+  # Google Cloud Vertex AI (Enterprise) - IAM/ADC based
+  vertex:
+    # Vertex AI OpenAI-compatible endpoint for Gemini 
+    # auto-constructed in provider.py if base_url is not set:
+    # https://{location}-aiplatform.googleapis.com/v1beta1/projects/{project_id}/locations/{location}/endpoints/openapi
+    base_url: ${VERTEX_BASE_URL} 
+    api_key: ${VERTEX_API_KEY} # Auto-generated via google-auth if empty
+    project_id: ${VERTEX_PROJECT_ID}
+    location: ${VERTEX_LOCATION:-us-central1}
+
+# ============================================================
+# Qdrant Vector DB
+# ============================================================
+qdrant:
+  url: ${QDRANT_URL}
+  api_key: ${QDRANT_API_KEY}
+  collection: ${QDRANT_COLLECTION}
+
+# ============================================================
+# Components — override provider/model via env vars
+# e.g. PLANNER_PROVIDER=local  PLANNER_MODEL=qwen2.5-coder-14b
+# ============================================================
+
+embedding:
+  provider: ${EMBEDDING_PROVIDER:-openai}
+  model: ${EMBEDDING_MODEL:-text-embedding-3-small}
+  # Optional: A stable identifier for the embedding space.
+  # If set, re-indexing is only triggered if this changes, allowing provider/model name changes.
+  identifier: ${EMBEDDING_IDENTIFIER:-openai-3-small}
+  max_tokens: ${EMBEDDING_MAX_TOKENS:-512}
+  # dimension: auto-detected from embedding model API response
+  batch_size: ${EMBEDDING_BATCH_SIZE:-100}
+
+sparse:
+  mode: ${SPARSE_MODE:-qdrant-bm25}   # qdrant-bm25 | splade | disabled
+  bm25:
+    vocab_size: ${BM25_VOCAB_SIZE:-30000}
+  splade:
+    model: ${SPLADE_MODEL:-prithivida/Splade_PP_en_v1}
+
+# Reranker (Cross-encoder, runs locally, no provider needed)
+reranker:
+  model: cross-encoder/ms-marco-MiniLM-L-6-v2
+  top_n: 100
+  top_m: 20
+
+analyst:
+  provider: ${ANALYST_PROVIDER:-openai}
+  model: ${ANALYST_MODEL:-gpt-4o-mini}
+  max_tokens: ${ANALYST_MAX_TOKENS:-2000}
+  temperature: ${ANALYST_TEMPERATURE:-0.1}
+
+planner:
+  provider: ${PLANNER_PROVIDER:-openai}
+  model: ${PLANNER_MODEL:-gpt-4o-mini}
+  max_tokens: ${PLANNER_MAX_TOKENS:-4000}
+  temperature: ${PLANNER_TEMPERATURE:-0.1}
+
+synthesizer:
+  provider: ${SYNTHESIZER_PROVIDER:-openai}
+  model: ${SYNTHESIZER_MODEL:-gpt-4o-mini}
+  max_tokens: ${SYNTHESIZER_MAX_TOKENS:-2000}
+  temperature: ${SYNTHESIZER_TEMPERATURE:-0.2}
+
+judge:
+  provider: ${JUDGE_PROVIDER:-openai}
+  model: ${JUDGE_MODEL:-gpt-4o-mini}
+  max_tokens: ${JUDGE_MAX_TOKENS:-1000}
+  temperature: ${JUDGE_TEMPERATURE:-0}
+
+# ============================================================
+# Ensemble Analyst
+# ============================================================
+ensemble:
+  enabled: ${ENSEMBLE_ENABLED:-true}   # true = 3-persona parallel, false = single analyst fallback
+
+# ============================================================
+# Budget & Quality
+# ============================================================
+budget:
+  max_iterations: 5
+  max_tokens_per_round: 32768
+  total_token_budget: 210000
+  max_evidence_cards: 200
+  working_set_size: 20
+
+quality_gate:
+  min_code_evidence: 2
+  min_tag_diversity: 2
+  require_call_edge: true
+  require_named_entity: true
+
+evidence_store:
+  max_pool: 200
+  working_set_size: 20
+  eviction_weights:
+    score: 1.0
+    recency: 0.2
+    kind_rarity: 0.2
+    tag_rarity: 0.15
+
+# ============================================================
+# Query Templates
+# ============================================================
+query_templates:
+  entry_point:
+    annotations:
+      - "@EventListener"
+      - "@Scheduled"
+      - "@KafkaListener"
+      - "@RabbitListener"
+      - "@PostMapping"
+      - "@GetMapping"
+      - "[HttpPost]"
+      - "[HttpGet]"
+      - "[Route]"
+  callsite:
+    patterns:
+      - '"{class}.{method}"'
+      - '"{class}#{method}"'
+      - '"{class}::{method}"'
+      - '"{method}("'
+      - 'await {method}'
+
+# ============================================================
+# Neo4j / AuraDB Graph Database (Optional)
+# ============================================================
+neo4j:
+  enabled: ${NEO4J_ENABLED:-false}
+  uri: ${NEO4J_URI}              # bolt://localhost:7687 or neo4j+s://xxx.databases.neo4j.io
+  username: ${NEO4J_USERNAME:-neo4j}
+  password: ${NEO4J_PASSWORD}
+  database: ${NEO4J_DATABASE:-neo4j}
+
+# ============================================================
+# MCP Server
+# ============================================================
+mcp:
+  name: agentic-rag
+  version: 1.0.0
+  description: Agentic RAG search for codebase

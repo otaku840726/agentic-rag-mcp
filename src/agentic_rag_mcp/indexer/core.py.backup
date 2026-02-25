@@ -1,0 +1,1029 @@
+"""
+IndexerService — 通用索引服務
+提供 MCP tool 方法：index_files, get_status, index_by_pattern
+不綁定任何特定專案結構
+"""
+
+import json
+import os
+import hashlib
+import logging
+import asyncio
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+from .embedder import Embedder
+from .sparse_embedder import SparseEmbedder
+from .bm25_tokenizer import Bm25Tokenizer
+from .chunker import Chunker
+from .qdrant_ops import QdrantOps
+from .analyzer import AnalyzerFactory, save_analysis_artifact
+
+logger = logging.getLogger(__name__)
+
+# ── Metadata schema ────────────────────────────────────────────────
+
+# Server 自動推斷的核心字段，client 不可覆蓋
+PROTECTED_METADATA_FIELDS = {
+    "category",     # 自動推斷: source-code, database, documentation, configuration, data, other
+    "language",     # 自動推斷: csharp, python, java, typescript, javascript, ...
+    "layer",        # 自動推斷: api, business, data, job (from directory name)
+    "service",      # 自動推斷: top-level directory name
+    "file_path",    # 自動設置: 相對路徑
+    "file_name",    # 自動設置: 檔名
+    "extension",    # 自動設置: 副檔名
+    "indexed_at",   # 自動設置: 索引時間
+}
+
+# Client 推薦使用的補充標籤（非強制，但建議統一命名）
+# 這些會顯示在 MCP tool description 裡引導 client 使用
+RECOMMENDED_CLIENT_TAGS = {
+    "jira_ticket":  "Jira 工單號, e.g. 'MNY-10137', 'INIT-2098'",
+    "domain":       "業務領域, e.g. 'deposit', 'payout', 'matching', 'robot', 'settlement'",
+    "priority":     "索引優先級, e.g. 'high', 'normal', 'low'",
+    "tags":         "自定義標籤列表, e.g. ['callback', 'merchant', 'status-flow']",
+    "description":  "補充描述, e.g. 'Merchant callback data flow entry point'",
+}
+
+# ── Metadata impact classification ────────────────────────────────────
+
+# Metadata fields that affect chunk content (used in metadata headers)
+# Changes to these fields require cache invalidation and re-embedding
+CONTENT_AFFECTING_METADATA = {
+    "file_path",  # Used in _file_level_header() and AST _build_header()
+}
+
+# Metadata fields that only exist in Qdrant payload (not in chunk content)
+# Changes to these fields can safely reuse cached embeddings
+PAYLOAD_ONLY_METADATA = {
+    # Client-provided supplementary tags
+    "jira_ticket", "domain", "priority", "tags", "description",
+    # System-generated metadata
+    "indexed_at", "chunk_index", "total_chunks", "content_preview",
+    # Derived/inferred metadata (not used in chunk content)
+    "file_name", "extension", "category", "language", "layer", "service",
+}
+
+
+def _safe_merge_metadata(inferred: Dict, client_meta: Optional[Dict]) -> Dict:
+    """Merge client metadata into inferred, protecting core fields."""
+    if not client_meta:
+        return inferred
+    safe = {k: v for k, v in client_meta.items() if k not in PROTECTED_METADATA_FIELDS}
+    skipped = [k for k in client_meta if k in PROTECTED_METADATA_FIELDS]
+    if skipped:
+        logger.warning("Client metadata tried to override protected fields (ignored): %s", skipped)
+    return {**inferred, **safe}
+
+
+# ── Filtering: whitelist approach ──────────────────────────────────
+# Only files with known-valuable extensions are indexed.
+# Env vars allow adding more without code changes.
+
+# Directories always excluded (regardless of extension)
+DEFAULT_EXCLUDE_DIRS = {
+    "bin", "obj", "node_modules", ".git", "packages",
+    "__pycache__", ".venv", "venv", "dist", "build",
+    "TestResults", ".vs", ".idea",
+    ".agentic-rag-cache",
+}
+
+# Filenames / suffixes always excluded (auto-generated, lock files, etc.)
+EXCLUDED_FILENAME_PATTERNS = {
+    ".Designer.cs", ".g.cs", ".g.i.cs", ".AssemblyInfo.cs",   # auto-generated C#
+    "GlobalUsings.g.cs",                                       # .NET 6+ auto-generated
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml",       # lock files
+    ".min.js", ".min.css", ".map",                             # minified / sourcemaps
+    ".nupkg.metadata",                                         # NuGet metadata
+}
+
+# 副檔名 → (category, language) 映射 (also serves as the base whitelist)
+EXT_CATEGORY_MAP = {
+    # ── .NET / C# ──
+    ".cs":         ("source-code", "csharp"),
+    ".cshtml":     ("source-code", "csharp"),
+    ".razor":      ("source-code", "csharp"),
+    ".xaml":       ("source-code", "csharp"),       # MAUI / WPF UI definitions
+
+    # ── JVM ──
+    ".java":       ("source-code", "java"),
+    ".kt":         ("source-code", "kotlin"),       # Android Robot
+    ".kts":        ("source-code", "kotlin"),       # Gradle build scripts
+
+    # ── Apple ──
+    ".swift":      ("source-code", "swift"),        # iOS ListenerApp
+
+    # ── JavaScript / TypeScript ──
+    ".js":         ("source-code", "javascript"),
+    ".jsx":        ("source-code", "javascript"),
+    ".cjs":        ("source-code", "javascript"),   # CommonJS
+    ".ts":         ("source-code", "typescript"),
+    ".tsx":        ("source-code", "typescript"),
+
+    # ── Mobile ──
+    ".dart":       ("source-code", "dart"),         # Flutter ListenerApp
+
+    # ── Systems ──
+    ".py":         ("source-code", "python"),
+    ".go":         ("source-code", "go"),
+    ".rs":         ("source-code", "rust"),
+    ".h":          ("source-code", "c"),            # OCR / DeCaptcha headers
+    ".c":          ("source-code", "c"),
+    ".cpp":        ("source-code", "cpp"),          # OCR / DeCaptcha
+    ".cc":         ("source-code", "cpp"),
+
+    # ── Web / Style ──
+    ".css":        ("source-code", "css"),
+    ".html":       ("documentation", None),
+
+    # ── Database ──
+    ".sql":        ("database", None),
+
+    # ── Documentation ──
+    ".md":         ("documentation", None),
+    ".txt":        ("documentation", None),
+
+    # ── Configuration ──
+    ".yaml":       ("configuration", None),
+    ".yml":        ("configuration", None),
+    ".json":       ("data", None),
+    ".xml":        ("configuration", None),
+    ".config":     ("configuration", None),         # NLog, App.config, Web.config
+    ".properties": ("configuration", None),         # Gradle properties
+    ".proto":      ("configuration", None),
+    ".graphql":    ("configuration", None),
+
+    # ── Scripts / DevOps ──
+    ".sh":         ("devops", "shell"),
+    ".ps1":        ("devops", "powershell"),
+    ".bat":        ("devops", "batch"),
+}
+
+# Exact filenames to index (no extension or special names)
+INDEXABLE_FILENAMES = {
+    "Dockerfile",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    ".gitignore",
+    ".dockerignore",
+    "Makefile",
+}
+
+# Base whitelist = all keys in EXT_CATEGORY_MAP
+INDEXABLE_EXTENSIONS = set(EXT_CATEGORY_MAP.keys())
+
+
+def _load_env_set(env_key: str) -> set:
+    """Load a comma-separated set from env var. e.g. '.tf,.hcl,.toml' """
+    raw = os.environ.get(env_key, "").strip()
+    if not raw:
+        return set()
+    return {v.strip() for v in raw.split(",") if v.strip()}
+
+
+def get_indexable_extensions() -> set:
+    """Compute the final indexable extensions set = base + env additions - env removals."""
+    extra = _load_env_set("INDEX_EXTRA_EXTENSIONS")       # e.g. ".tf,.hcl,.toml"
+    removed = _load_env_set("INDEX_REMOVE_EXTENSIONS")    # e.g. ".json,.xml"
+    return (INDEXABLE_EXTENSIONS | extra) - removed
+
+
+def get_exclude_dirs() -> set:
+    """Compute the final excluded dirs set = base + env additions."""
+    extra = _load_env_set("INDEX_EXTRA_EXCLUDE_DIRS")     # e.g. "tmp,logs,artifacts"
+    return DEFAULT_EXCLUDE_DIRS | extra
+
+
+def get_excluded_filename_patterns() -> set:
+    """Compute the final excluded filename patterns = base + env additions."""
+    extra = _load_env_set("INDEX_EXTRA_EXCLUDE_FILES")    # e.g. ".generated.cs,.auto.ts"
+    return EXCLUDED_FILENAME_PATTERNS | extra
+
+
+class IndexerService:
+    """通用 Codebase Indexer Service"""
+
+    def __init__(self):
+        self.base_dir = Path.cwd()
+        logger.info(f"IndexerService initialized with base_dir: {self.base_dir}")
+        
+        # 移除本地 JSON 狀態文件，改用 Qdrant
+        # self.state_path = self.base_dir / ".agentic-rag-index-state.json"
+        # self.state = self._load_state()
+
+        # 初始化 Qdrant state store（延遲初始化，在 qdrant property 中創建）
+        self._state_store = None
+
+        self._embedder: Optional[Embedder] = None
+        self._sparse_encoder = None  # Bm25Tokenizer | SparseEmbedder | None
+        self._sparse_encoder_loaded = False
+        self._chunker: Optional[Chunker] = None
+        self._qdrant: Optional[QdrantOps] = None
+        
+        # Optimization: cache collection initialization status
+        self._collection_initialized = False
+
+    # ------------------------------------------------------------------
+    # Lazy component accessors
+    # ------------------------------------------------------------------
+
+    @property
+    def embedder(self) -> Embedder:
+        if self._embedder is None:
+            self._embedder = Embedder()
+        return self._embedder
+
+    @property
+    def sparse_encoder(self):
+        """Return Bm25Tokenizer / SparseEmbedder / None based on sparse.mode."""
+        if not self._sparse_encoder_loaded:
+            from ..provider import get_sparse_config
+            sparse_cfg = get_sparse_config()
+            mode = sparse_cfg["mode"]
+            if mode == "qdrant-bm25":
+                vocab_size = int(sparse_cfg["bm25"].get("vocab_size", 30000))
+                self._sparse_encoder = Bm25Tokenizer(vocab_size=vocab_size)
+            elif mode == "splade":
+                model = sparse_cfg["splade"].get("model", "prithivida/Splade_PP_en_v1")
+                self._sparse_encoder = SparseEmbedder(model_name=model)
+            else:
+                self._sparse_encoder = None
+            self._sparse_encoder_loaded = True
+        return self._sparse_encoder
+
+    @property
+    def chunker(self) -> Chunker:
+        if self._chunker is None:
+            from ..provider import load_config
+            cfg = load_config()
+            max_tokens = int(cfg.get("embedding", {}).get("max_tokens", 8191))
+            self._chunker = Chunker(max_tokens=max_tokens)
+        return self._chunker
+
+    @property
+    def qdrant(self) -> QdrantOps:
+        if self._qdrant is None:
+            self._qdrant = QdrantOps()
+        return self._qdrant
+    
+    @property
+    def state_store(self):
+        """Lazy load Qdrant state store"""
+        if self._state_store is None:
+            from .qdrant_state_store import QdrantStateStore
+            self._state_store = QdrantStateStore(
+                client=self.qdrant.client,
+                main_collection=self.qdrant.collection_name
+            )
+        return self._state_store
+
+    # ------------------------------------------------------------------
+    # State
+    # ------------------------------------------------------------------
+
+    def _get_embedding_identity(self) -> str:
+        """獲取 embedding 模型的唯一身份標識 (優先使用 identifier)"""
+        from ..provider import get_component_config
+        comp_cfg = get_component_config("embedding")
+        # 優先使用 identifier，如果沒設則用 model 名稱
+        return comp_cfg.identifier or comp_cfg.model
+
+    def _get_sparse_mode(self) -> str:
+        from ..provider import get_sparse_config
+        return get_sparse_config()["mode"]
+
+    # 移除 _load_state 和 _save_state，改用 QdrantStateStore
+    # def _load_state(self) -> Dict:
+    #     ...
+    # def _save_state(self):
+    #     ...
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _get_file_hash(self, file_path: Path) -> str:
+        try:
+            import xxhash
+            hasher = xxhash.xxh64()
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except ImportError:
+            hasher = hashlib.md5()
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+
+    def _should_index_file(
+        self, 
+        file_path: Path, 
+        new_metadata: Dict = None, 
+        force: bool = False,
+        cached_state: Optional[Dict] = None
+    ) -> tuple[bool, str]:
+        """檢查文件是否需要索引（使用 Qdrant 狀態）
+        
+        Args:
+            file_path: 文件路徑
+            new_metadata: 新的 metadata（用於檢測 content-affecting 變更）
+            force: 強制索引
+            cached_state: 預載的文件狀態（可選，避免重複查詢）
+            
+        Returns:
+            (should_index, reason) - 是否需要索引及原因
+        """
+        if force:
+            return True, "force=True"
+            
+        rel_path = str(file_path.relative_to(self.base_dir))
+        current_hash = self._get_file_hash(file_path)
+        
+        # 使用 cached_state 或查詢 Qdrant
+        if cached_state is not None:
+            file_state = cached_state
+        else:
+            file_state = self.state_store.get_file_state(rel_path)
+        
+        # 1. 檢查檔案內容變更
+        if not file_state or file_state.get("hash") != current_hash:
+            return True, "file content changed"
+        
+        # 2. 檢查 content-affecting metadata 變更
+        if new_metadata:
+            stored_metadata = file_state.get("metadata", {})
+            for key in CONTENT_AFFECTING_METADATA:
+                new_value = new_metadata.get(key)
+                
+                # Only check if the key exists in stored metadata
+                # This prevents false positives for files indexed before metadata tracking
+                if key in stored_metadata:
+                    stored_value = stored_metadata.get(key)
+                    if new_value != stored_value:
+                        return True, f"content-affecting metadata changed: {key} ({stored_value} -> {new_value})"
+        
+        # 檔案內容和 content-affecting metadata 都沒變，跳過
+        return False, "no content changes"
+
+    def _is_excluded(self, file_path: Path) -> bool:
+        """Whitelist-based filtering.
+
+        A file is included if:
+          - Its extension is in the indexable whitelist, OR
+          - Its exact filename is in INDEXABLE_FILENAMES (e.g. Dockerfile)
+        AND it is NOT in an excluded directory or matched by an excluded filename pattern.
+        """
+        parts = file_path.parts
+        fname = file_path.name
+
+        # 1. Excluded directories
+        if any(p in get_exclude_dirs() for p in parts):
+            return True
+
+        # 2. Excluded filename patterns (suffix match, e.g. ".Designer.cs")
+        for pattern in get_excluded_filename_patterns():
+            if fname.endswith(pattern):
+                return True
+
+        # 3. Whitelist: extension OR exact filename
+        ext = file_path.suffix.lower()
+        if ext in get_indexable_extensions():
+            return False
+        if fname in INDEXABLE_FILENAMES:
+            return False
+
+        # Not in whitelist → exclude
+        return True
+
+    @staticmethod
+    def _infer_metadata(rel_path: str) -> Dict[str, Any]:
+        """從路徑純粹推斷 metadata，不依賴任何配置"""
+        p = Path(rel_path)
+        ext = p.suffix.lower()
+        parts = p.parts
+
+        meta: Dict[str, Any] = {}
+
+        # 1) 副檔名 → category + language
+        if ext in EXT_CATEGORY_MAP:
+            category, language = EXT_CATEGORY_MAP[ext]
+            meta["category"] = category
+            if language:
+                meta["language"] = language
+        elif p.name in INDEXABLE_FILENAMES:
+            # Special filenames without recognized extensions (e.g. Dockerfile)
+            name_lower = p.name.lower()
+            if "docker" in name_lower:
+                meta["category"] = "devops"
+                meta["language"] = "dockerfile"
+            elif name_lower == "makefile":
+                meta["category"] = "devops"
+                meta["language"] = "make"
+            else:
+                meta["category"] = "configuration"
+        else:
+            meta["category"] = "other"
+
+        # 2) 頂層目錄 → service
+        if len(parts) > 1:
+            meta["service"] = parts[0]
+
+        # 3) 目錄名 → layer hint
+        dir_lower = {p.lower() for p in parts[:-1]}
+        if dir_lower & {"controllers", "controller", "api"}:
+            meta["layer"] = "api"
+        elif dir_lower & {"business", "services", "service"}:
+            meta["layer"] = "business"
+        elif dir_lower & {"data", "entities", "models", "entity"}:
+            meta["layer"] = "data"
+        elif dir_lower & {"job", "jobs", "workers"}:
+            meta["layer"] = "job"
+
+        return meta
+
+    def _index_file(self, file_path: Path, base_metadata: Dict) -> int:
+        """索引單個文件，返回 chunk 數"""
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+
+            if not content.strip():
+                return 0
+
+            rel_path = str(file_path.relative_to(self.base_dir))
+            metadata = {
+                **base_metadata,
+                "file_path": rel_path,
+                "file_name": file_path.name,
+                "extension": file_path.suffix,
+                "indexed_at": datetime.now().isoformat(),
+            }
+
+            chunks = self.chunker.chunk_file(content, rel_path, metadata)
+            if not chunks:
+                return 0
+
+            texts = [chunk.content for chunk in chunks]
+            embeddings = self.embedder.embed_batch(texts)
+            sparse_embeddings = (
+                self.sparse_encoder.embed_batch(texts)
+                if self.sparse_encoder is not None
+                else None
+            )
+
+            payloads = [
+                {**chunk.metadata, "content_preview": chunk.content[:500]}
+                for chunk in chunks
+            ]
+
+            self.qdrant.upsert_by_file_path(
+                rel_path, embeddings, payloads, sparse_vectors=sparse_embeddings
+            )
+
+            # 保存狀態到 Qdrant (包含 metadata 用於後續比對)
+            self.state_store.save_file_state(
+                file_path=rel_path,
+                file_hash=self._get_file_hash(file_path),
+                chunks=len(chunks),
+                metadata=metadata  # 傳遞 metadata 用於檢測變更
+            )
+
+            return len(chunks)
+
+        except Exception as e:
+            logger.error(f"Error indexing {file_path}: {e}")
+            raise
+
+    def _needs_recreate(self, current_identity: str) -> Optional[str]:
+        """檢查是否需要重建 collection。
+
+        Returns:
+            需要重建的原因，或 None。
+        """
+        # 從 Qdrant 獲取全局狀態
+        global_state = self.state_store.load_global_state() or {}
+        stored_identity = global_state.get("embedding_model")
+        # 1) identity (identifier or model) 變更
+        if stored_identity and stored_identity != current_identity:
+            return f"embedding identity changed ({stored_identity} -> {current_identity})"
+
+        # 2) sparse_mode 變更
+        current_sparse_mode = self._get_sparse_mode()
+        stored_sparse_mode = global_state.get("sparse_mode")
+        if stored_sparse_mode and stored_sparse_mode != current_sparse_mode:
+            return f"sparse_mode changed ({stored_sparse_mode} -> {current_sparse_mode})"
+
+        # 3) collection 已存在但 dimension 不匹配（legacy state 或手動建錯）
+        try:
+            info = self.qdrant.get_collection_info()
+            if "error" not in info:
+                cfg = info.get("config", {})
+                existing_dim = (cfg.get("dense", {}) or {}).get("size")
+                current_dim = self.embedder.get_dimension()
+                if existing_dim and existing_dim != current_dim:
+                    return (
+                        f"dimension mismatch (collection={existing_dim}, "
+                        f"model identity {current_identity}={current_dim})"
+                    )
+        except Exception:
+            pass
+
+        return None
+
+    def _ensure_collection(self) -> Optional[str]:
+        """確保 collection 存在，並檢測 embedding model / dimension / sparse_mode 變更。
+
+        Returns:
+            若重建，回傳警告訊息；否則 None。
+        """
+        # Optimization: skip if already initialized
+        if self._collection_initialized:
+            return None
+        
+        current_identity = self._get_embedding_identity()
+        current_sparse_mode = self._get_sparse_mode()
+        reason = self._needs_recreate(current_identity)
+        warning = None
+
+        if reason:
+            logger.warning("Recreating collection: %s", reason)
+            self.qdrant.create_collection(
+                dimension=self.embedder.get_dimension(),
+                recreate=True,
+                sparse_mode=current_sparse_mode,
+            )
+            # 重建後，保存新的全局狀態到 Qdrant
+            self.state_store.save_global_state(
+                embedding_model=current_identity,
+                sparse_mode=current_sparse_mode
+            )
+            warning = f"Collection recreated ({reason}). All files will be re-indexed."
+
+        # 確保 collection 存在（首次使用時創建）
+        self.qdrant.create_collection(
+            dimension=self.embedder.get_dimension(),
+            sparse_mode=current_sparse_mode,
+        )
+        # 保存全局狀態到 Qdrant（如果還沒有）
+        global_state = self.state_store.load_global_state()
+        if not global_state or not global_state.get("embedding_model"):
+            self.state_store.save_global_state(
+                embedding_model=current_identity,
+                sparse_mode=current_sparse_mode
+            )
+
+        # Mark as initialized
+        self._collection_initialized = True
+        return warning
+
+    # ==================================================================
+    # Public MCP Tool Methods
+    # ==================================================================
+
+    def index_files(self, file_paths: List[str], metadata: Optional[Dict] = None) -> Dict[str, Any]:
+        """索引指定文件
+
+        Args:
+            file_paths: 相對於 codebase root 的文件路徑列表
+            metadata: 可選的額外 metadata，合併到自動推斷的 metadata
+        """
+        warning = self._ensure_collection()
+
+        results = []
+        errors = []
+        total_chunks = 0
+
+        for rel in file_paths:
+            abs_path = self.base_dir / rel
+            if not abs_path.is_file():
+                errors.append({"file": rel, "error": "File not found"})
+                continue
+
+            inferred = self._infer_metadata(rel)
+            inferred = _safe_merge_metadata(inferred, metadata)
+
+            try:
+                n_chunks = self._index_file(abs_path, inferred)
+                total_chunks += n_chunks
+                results.append({"file": rel, "chunks": n_chunks})
+            except Exception as e:
+                errors.append({"file": rel, "error": str(e)})
+
+        # 更新最後索引時間
+        self.state_store.update_last_index_time()
+
+        resp = {
+            "files_indexed": len(results),
+            "chunks_indexed": total_chunks,
+            "results": results,
+            "errors": errors,
+        }
+        if warning:
+            resp["warning"] = warning
+        return resp
+
+    def get_status(self) -> Dict[str, Any]:
+        """查看索引狀態（使用 Qdrant 狀態）"""
+        try:
+            qdrant_stats = self.qdrant.get_stats()
+        except Exception as e:
+            qdrant_stats = {"error": str(e)}
+
+        # 從 Qdrant 獲取全局狀態和文件計數
+        global_state = self.state_store.load_global_state() or {}
+        indexed_files_count = self.state_store.count_indexed_files()
+        
+        return {
+            "qdrant": qdrant_stats,
+            "local_state": {
+                "indexed_files": indexed_files_count,
+                "embedding_model": global_state.get("embedding_model"),
+                "last_index_time": global_state.get("last_index_time"),
+            },
+        }
+
+    def index_by_pattern(
+        self, pattern: str, metadata: Optional[Dict] = None, force: bool = False
+    ) -> Dict[str, Any]:
+        """按 glob pattern 批量索引
+
+        Args:
+            pattern: glob pattern（相對於 codebase root），例如 "knowledge/**/*.yaml"
+            metadata: 可選的額外 metadata，合併到自動推斷的 metadata
+            force: 強制重新索引
+        """
+        warning = self._ensure_collection()
+
+        matched = sorted(self.base_dir.glob(pattern))
+
+        # ── Batch load file states (optimization) ──
+        # Pre-filter files and collect paths to check
+        file_paths_to_check = []
+        for file_path in matched:
+            if file_path.is_file():
+                rel_path = str(file_path.relative_to(self.base_dir))
+                if not self._is_excluded(Path(rel_path)):
+                    file_paths_to_check.append(rel_path)
+        
+        # Batch load all file states at once (1 query instead of N)
+        logger.info(f"Batch loading states for {len(file_paths_to_check)} files...")
+        cached_states = self.state_store.batch_get_file_states(file_paths_to_check)
+        logger.info(f"Loaded {len(cached_states)} existing file states from Qdrant")
+        # ──────────────────────────────────────────
+
+        files_indexed = 0
+        chunks_indexed = 0
+        files_skipped = 0
+        errors = []
+
+        total_files = len(matched)
+        logger.info(f"Starting indexing: {total_files} files matched pattern '{pattern}'")
+
+        for idx, file_path in enumerate(matched, 1):
+            if not file_path.is_file():
+                continue
+            rel_path = str(file_path.relative_to(self.base_dir))
+            if self._is_excluded(Path(rel_path)):
+                continue
+
+            # 合併 metadata (用於檢測變更)
+            inferred = self._infer_metadata(rel_path)
+            merged_metadata = _safe_merge_metadata(inferred, metadata)
+
+            # 檢查是否需要索引 (使用 cached state，避免重複查詢)
+            cached_state = cached_states.get(rel_path)
+            should_index, reason = self._should_index_file(
+                file_path, merged_metadata, force,
+                cached_state=cached_state
+            )
+            if not should_index:
+                files_skipped += 1
+                logger.debug(f"Skipped {rel_path}: {reason}")
+                continue
+
+            # 進度日誌 (每 10 個檔案或重要事件)
+            if idx % 10 == 0 or idx == 1:
+                logger.info(f"Progress: {idx}/{total_files} files processed, {files_indexed} indexed, {files_skipped} skipped")
+
+            try:
+                n = self._index_file(file_path, merged_metadata)
+                if n > 0:
+                    files_indexed += 1
+                    chunks_indexed += n
+                    logger.info(f"Indexed {rel_path}: {n} chunks")
+            except Exception as e:
+                errors.append({"file": rel_path, "error": str(e)})
+                logger.error(f"Error indexing {rel_path}: {e}")
+
+        # 更新最後索引時間
+        self.state_store.update_last_index_time()
+
+        # 總結日誌
+        logger.info(
+            f"Indexing completed: {files_indexed} files indexed, "
+            f"{chunks_indexed} chunks created, {files_skipped} files skipped, "
+            f"{len(errors)} errors"
+        )
+
+        resp = {
+            "pattern": pattern,
+            "base_dir": str(self.base_dir),  # Debug: show actual working directory
+            "files_found": len(matched),
+            "files_indexed": files_indexed,
+            "chunks_indexed": chunks_indexed,
+            "files_skipped": files_skipped,
+            "errors": errors,
+        }
+        if warning:
+            resp["warning"] = warning
+        return resp
+
+    def index_analysis_artifacts(self, analysis_dir: str) -> Dict[str, Any]:
+        """索引預先計算的分析結果 (JSON artifacts)
+
+        Args:
+            analysis_dir: 包含 analysis result JSON 檔案的目錄路徑
+        """
+        warning = self._ensure_collection()
+        
+        analysis_path = Path(analysis_dir)
+        if not analysis_path.exists():
+            return {"error": f"Directory not found: {analysis_dir}"}
+
+        results = []
+        errors = []
+        total_symbols = 0
+        
+        # Iterate over JSON files
+        json_files = sorted(analysis_path.glob("*.json"))
+        logger.info(f"Found {len(json_files)} analysis artifacts in {analysis_dir}")
+
+        for json_file in json_files:
+            try:
+                with open(json_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                
+                # Check for required fields
+                if "file_path" not in data or "symbols" not in data:
+                    logger.warning(f"Skipping invalid analysis artifact: {json_file}")
+                    continue
+                    
+                original_path = Path(data["file_path"])
+                # Try to make relative to base_dir if possible, else use as is (or name)
+                try:
+                    rel_path = str(original_path.relative_to(self.base_dir))
+                except ValueError:
+                     # If absolute path is not in base_dir, use original path string
+                     # For remote analysis or Docker volume mapping, this might need adjustment
+                     rel_path = str(original_path)
+                     # Strip leading slash if present to look cleaner
+                     if rel_path.startswith("/"):
+                         rel_path = rel_path[1:]
+
+                symbols = data["symbols"]
+                if not symbols:
+                    continue
+
+                # Prepare for indexing
+                texts = []
+                payloads = []
+                
+                for i, sym in enumerate(symbols):
+                    content = sym.get("content", "")
+                    if not content:
+                        continue
+                        
+                    texts.append(content)
+                    
+                    # Construct payload
+                    # Merge symbol data with file metadata
+                    payload = {
+                        "file_path": rel_path,
+                        "file_name": original_path.name,
+                        "extension": original_path.suffix,
+                        "chunk_index": i,
+                        "total_chunks": len(symbols),
+                        "content_preview": content[:500],
+                        "symbol_name": sym.get("name"),
+                        "symbol_type": sym.get("node_type"),
+                        "category": "source-code"
+                    }
+                    
+                    # Add other symbol fields as metadata, excluding content
+                    for k, v in sym.items():
+                        if k not in ["content", "metadata_header"]:
+                             payload[k] = v
+                    
+                    payloads.append(payload)
+
+                if not texts:
+                    continue
+
+                # Embed
+                embeddings = self.embedder.embed_batch(texts)
+                sparse_embeddings = (
+                    self.sparse_encoder.embed_batch(texts)
+                    if self.sparse_encoder is not None
+                    else None
+                )
+
+                # Upsert
+                self.qdrant.upsert_by_file_path(
+                    rel_path, embeddings, payloads, sparse_vectors=sparse_embeddings
+                )
+                
+                # Save file state to prevent re-indexing if unchanged
+                # We can compute a hash of the JSON content as proxy for file hash
+                # Or just mark it as done. Ideally, we should use original file hash from artifact if available.
+                # Since artifact doesn't have original hash, let's skip state saving for now or use timestamp.
+                # Actually, standard flow uses state for incremental indexing. 
+                # Here we assume artifacts are fresh.
+                
+                total_symbols += len(texts)
+                results.append({"file": rel_path, "symbols": len(texts)})
+                logger.info(f"Indexed analysis for {rel_path}: {len(texts)} symbols")
+
+            except Exception as e:
+                errors.append({"file": json_file.name, "error": str(e)})
+                logger.error(f"Error indexing artifact {json_file}: {e}")
+
+        # Update last index time
+        self.state_store.update_last_index_time()
+
+        resp = {
+            "artifacts_processed": len(results),
+            "symbols_indexed": total_symbols,
+            "results": results,
+            "errors": errors
+        }
+        if warning:
+            resp["warning"] = warning
+        return resp
+
+    def run_analysis(
+        self, 
+        directory: str, 
+        output_dir: Optional[str] = None,
+        file_extensions: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """Runs static analysis on files in a directory with automatic analyzer selection.
+
+        Args:
+            directory: Directory to analyze (relative to codebase root).
+            output_dir: Optional directory to save JSON artifacts (default: .agentic-rag-cache/analysis/).
+            file_extensions: Optional list of file extensions to limit analysis (e.g., ['.java', '.cs']).
+            
+        Returns:
+            Dictionary with analysis results and statistics.
+        """
+        from .project_detector import ProjectDetector, AnalyzerType
+        
+        # Resolve directory path
+        dir_path = self.base_dir / directory
+        if not dir_path.exists():
+            return {"error": f"Directory not found: {directory}"}
+        
+        # Default output directory: .agentic-rag-cache/analysis/{folder_name}/
+        if output_dir is None:
+            # Use the last component of the directory as folder name
+            folder_name = Path(directory).name
+            cache_dir = self.base_dir / ".agentic-rag-cache" / "analysis" / folder_name
+            output_dir = str(cache_dir)
+        else:
+            cache_dir = Path(output_dir)
+        
+        # Clean up previous analysis results for this directory
+        if cache_dir.exists():
+            import shutil
+            logger.info(f"Cleaning up previous analysis results in {cache_dir}")
+            shutil.rmtree(cache_dir)
+        
+        # Create output directory
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize project detector
+        detector = ProjectDetector(self.base_dir)
+        
+        # Collect all files to analyze
+        all_files = []
+        for file_path in dir_path.rglob("*"):
+            if not file_path.is_file():
+                continue
+            
+            # Apply exclusion logic
+            rel_path = file_path.relative_to(self.base_dir)
+            if self._is_excluded(Path(rel_path)):
+                continue
+            
+            # Filter by extension if specified
+            if file_extensions:
+                if file_path.suffix.lower() not in file_extensions:
+                    continue
+            
+            all_files.append(file_path)
+        
+        logger.info(f"Found {len(all_files)} files to analyze in {directory}")
+        
+        # Get analyzer strategy (group files by analyzer type)
+        strategy = detector.get_analyzer_strategy(dir_path, all_files)
+        
+        # Track results
+        total_analyzed = 0
+        total_skipped = 0
+        errors = []
+        results_by_analyzer = {}
+        
+        # Process each analyzer group
+        for analyzer_type, files in strategy.items():
+            logger.info(f"Processing {len(files)} files with {analyzer_type.value} analyzer")
+            
+            # Get Docker image name if applicable
+            image_name = None
+            if analyzer_type == AnalyzerType.SPOON:
+                import os
+                image_name = os.getenv("ANALYZER_SPOON_IMAGE", "optimuspay-spoon-analyzer:latest")
+            elif analyzer_type == AnalyzerType.ROSLYN:
+                import os
+                image_name = os.getenv("ANALYZER_ROSLYN_IMAGE", "optimuspay-roslyn-analyzer:latest")
+            
+            # Check if analyzer is available (will auto-build if image missing)
+            if not detector.is_analyzer_available(analyzer_type, image_name):
+                logger.warning(
+                    f"{analyzer_type.value} analyzer not available "
+                    f"(Docker unavailable or build failed), "
+                    f"falling back to tree-sitter for {len(files)} files"
+                )
+                analyzer_type = AnalyzerType.TREE_SITTER
+            
+            # Create analyzer
+            try:
+                # Use first file as context for analyzer creation
+                analyzer = AnalyzerFactory.create_auto(str(files[0]), analyzer_type.value)
+            except Exception as e:
+                logger.error(f"Failed to create {analyzer_type.value} analyzer: {e}")
+                # Try to fallback to tree-sitter
+                if analyzer_type != AnalyzerType.TREE_SITTER:
+                    logger.info(f"Attempting fallback to tree-sitter for {len(files)} files")
+                    try:
+                        analyzer = AnalyzerFactory.create_auto(str(files[0]), AnalyzerType.TREE_SITTER.value)
+                        analyzer_type = AnalyzerType.TREE_SITTER
+                    except Exception as fallback_error:
+                        logger.error(f"Fallback to tree-sitter also failed: {fallback_error}")
+                        errors.append({
+                            "analyzer": analyzer_type.value,
+                            "error": f"Failed to create analyzer and fallback: {str(e)}"
+                        })
+                        total_skipped += len(files)
+                        continue
+                else:
+                    errors.append({
+                        "analyzer": analyzer_type.value,
+                        "error": f"Failed to create analyzer: {str(e)}"
+                    })
+                    total_skipped += len(files)
+                    continue
+            
+            # Analyze files
+            analyzed_files = []
+            for file_path in files:
+                rel_path = str(file_path.relative_to(self.base_dir))
+                
+                try:
+                    # Analyze
+                    result = analyzer.analyze(str(file_path))
+                    
+                    # Save artifact
+                    save_analysis_artifact(result, output_dir)
+                    
+                    analyzed_files.append(rel_path)
+                    total_analyzed += 1
+                    logger.debug(f"Analyzed {rel_path} with {analyzer_type.value}")
+                    
+                except Exception as e:
+                    errors.append({"file": rel_path, "error": str(e)})
+                    logger.error(f"Error analyzing {rel_path}: {e}")
+                    total_skipped += 1
+            
+            results_by_analyzer[analyzer_type.value] = {
+                "files_analyzed": len(analyzed_files),
+                "files": analyzed_files
+            }
+        
+        logger.info(
+            f"Analysis completed: {total_analyzed} files analyzed, "
+            f"{total_skipped} skipped/failed"
+        )
+        
+        return {
+            "directory": directory,
+            "output_dir": output_dir,
+            "total_files_found": len(all_files),
+            "files_analyzed": total_analyzed,
+            "files_skipped": total_skipped,
+            "errors": errors,
+            "results_by_analyzer": results_by_analyzer
+        }
+

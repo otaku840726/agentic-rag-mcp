@@ -1,0 +1,39 @@
+{
+  "name": "agentic-rag-mcp",
+  "version": "0.1.0",
+  "description": "Agentic RAG MCP Server for codebase search with multi-hop retrieval",
+  "bin": {
+    "agentic-rag-mcp": "./bin/run.js"
+  },
+  "scripts": {
+    "start": "node bin/run.js",
+    "postinstall": "node bin/postinstall.js"
+  },
+  "keywords": [
+    "mcp",
+    "rag",
+    "agentic",
+    "search",
+    "codebase",
+    "claude"
+  ],
+  "author": "Agentic RAG MCP Contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anthropics/agentic-rag-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/anthropics/agentic-rag-mcp/issues"
+  },
+  "homepage": "https://github.com/anthropics/agentic-rag-mcp#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "pyproject.toml",
+    "requirements.txt"
+  ]
+}
