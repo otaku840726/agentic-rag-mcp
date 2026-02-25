@@ -655,8 +655,10 @@ class IndexerService:
                         extra_rels = []
                         for sym in symbols:
                             fqn = sym.get("fqn") or sym.get("name", "unknown")
-                            # Short name: last segment of FQN (e.g. "DepositService")
-                            short_name = fqn.split(".")[-1] if "." in fqn else fqn
+                            # Short name: last segment of FQN (e.g. "DepositService").
+                            # Strip param types for Java method FQNs like "Service.doThing(Dto,int)"
+                            _raw = fqn.split(".")[-1] if "." in fqn else fqn
+                            short_name = _raw.split("(")[0] if "(" in _raw else _raw
 
                             # Resolve actual .cs file path from per-symbol metadata.
                             # Docker mounts sln_dir at /src/ inside the container.
@@ -1125,7 +1127,9 @@ class IndexerService:
         extra_rels: List[Dict] = []
         for sym in result.symbols:
             fqn = sym.get("fqn") or sym.get("name", "unknown")
-            short_name = fqn.split(".")[-1]
+            # Strip param types for Java method FQNs like "Service.doThing(Dto,int)"
+            _raw = fqn.split(".")[-1]
+            short_name = _raw.split("(")[0] if "(" in _raw else _raw
             docker_path = sym.get("metadata", {}).get("file_path", "")
             actual_file_path = (
                 sln_dir + "/" + docker_path[len("/src/"):]

@@ -165,6 +165,8 @@ class GraphStore:
             "SUBSECTION_OF",
             # Messaging relationships
             "PUBLISHES_TO", "SUBSCRIBES_TO",
+            # Annotation usage: class/method/field → annotation type
+            "ANNOTATED_BY",
         }
 
         # Group by relationship type
@@ -187,17 +189,17 @@ class GraphStore:
                     cypher = f"""
                     UNWIND $rels AS rel
                     MERGE (src:File {{path: rel.source}})
-                    MERGE (tgt:Symbol {{fqn: rel.target}})
-                    ON CREATE SET tgt.name = rel.target, tgt.kind = 'external', tgt.project = $default_project
+                    MERGE (tgt:Symbol {{fqn: rel.target, project: $default_project}})
+                    ON CREATE SET tgt.name = rel.target, tgt.kind = 'external'
                     MERGE (src)-[r:IMPORTS]->(tgt)
                     RETURN count(r)
                     """
                 elif rel_type in ("PUBLISHES_TO", "SUBSCRIBES_TO"):
                     cypher = f"""
                     UNWIND $rels AS rel
-                    MERGE (src:Symbol {{fqn: rel.source}})
-                    MERGE (tgt:Symbol {{fqn: rel.target}})
-                    ON CREATE SET tgt.name = COALESCE(rel.target_name, rel.target), tgt.kind = 'external', tgt.project = $default_project
+                    MERGE (src:Symbol {{fqn: rel.source, project: $default_project}})
+                    MERGE (tgt:Symbol {{fqn: rel.target, project: $default_project}})
+                    ON CREATE SET tgt.name = COALESCE(rel.target_name, rel.target), tgt.kind = 'external'
                     MERGE (src)-[r:{rel_type}]->(tgt)
                     SET r.queue_name = rel.metadata.queue_name,
                         r.line       = rel.metadata.line
@@ -206,9 +208,9 @@ class GraphStore:
                 else:
                     cypher = f"""
                     UNWIND $rels AS rel
-                    MERGE (src:Symbol {{fqn: rel.source}})
-                    MERGE (tgt:Symbol {{fqn: rel.target}})
-                    ON CREATE SET tgt.name = COALESCE(rel.target_name, rel.target), tgt.kind = 'external', tgt.project = $default_project
+                    MERGE (src:Symbol {{fqn: rel.source, project: $default_project}})
+                    MERGE (tgt:Symbol {{fqn: rel.target, project: $default_project}})
+                    ON CREATE SET tgt.name = COALESCE(rel.target_name, rel.target), tgt.kind = 'external'
                     MERGE (src)-[r:{rel_type}]->(tgt)
                     SET r.kind = rel.kind
                     RETURN count(r)

@@ -13,9 +13,8 @@ import spoon.reflect.visitor.CtScanner;
 
 import java.io.File;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.*;
-import java.util.Optional;
+import java.util.stream.Collectors;
 
 /**
  * Spoon-based Java analyzer.
@@ -111,6 +110,9 @@ public class SpoonAnalyzer {
             symbols.add(sym);
         }
 
+        // Class-level annotations → ANNOTATED_BY
+        addAnnotationEdges(type.getAnnotations(), fqn, relationships);
+
         // Superclass → INHERITS
         if (type instanceof CtClass<?> ctClass) {
             CtTypeReference<?> superRef = ctClass.getSuperclass();
@@ -124,7 +126,7 @@ public class SpoonAnalyzer {
             addRelationship(relationships, fqn, iface.getQualifiedName(), "implements");
         }
 
-        // Enum members → MEMBER_OF
+        // Enum members → MEMBER_OF  [Bug 1 fix: enum members already had this]
         if (type instanceof CtEnum<?> ctEnum) {
             for (CtEnumValue<?> ev : ctEnum.getEnumValues()) {
                 String memberFqn = fqn + "." + ev.getSimpleName();
@@ -148,9 +150,19 @@ public class SpoonAnalyzer {
             }
         }
 
-        // Methods → symbols + CALLS + USES_TYPE
+        // Methods → symbols + MEMBER_OF + CALLS + USES_TYPE  [Bug 1 fix: MEMBER_OF now added]
         for (CtMethod<?> method : type.getMethods()) {
             processMethod(method, fqn, filePath, symbols, relationships, seen, type);
+        }
+
+        // Bug 3 fix: Constructors → symbols + MEMBER_OF + CALLS + USES_TYPE
+        for (CtConstructor<?> ctor : type.getConstructors()) {
+            processConstructor(ctor, fqn, filePath, symbols, relationships, seen, type);
+        }
+
+        // Bug 2 fix: Fields → symbols + MEMBER_OF + USES_TYPE
+        for (CtField<?> field : type.getFields()) {
+            processField(field, fqn, filePath, symbols, relationships, seen, type);
         }
 
         // Nested types
@@ -162,7 +174,11 @@ public class SpoonAnalyzer {
     private static void processMethod(CtMethod<?> method, String ownerFqn, String filePath,
                                        ArrayNode symbols, ArrayNode relationships,
                                        Set<String> seen, CtType<?> ownerType) {
-        String methodFqn = ownerFqn + "." + method.getSimpleName();
+        // Bug 4 fix: include param types in FQN to support overloaded methods
+        String paramSig = method.getParameters().stream()
+            .map(p -> p.getType().getSimpleName())
+            .collect(Collectors.joining(","));
+        String methodFqn = ownerFqn + "." + method.getSimpleName() + "(" + paramSig + ")";
         int startLine = method.getPosition().isValidPosition() ? method.getPosition().getLine() : 0;
         int endLine = method.getPosition().isValidPosition() ? method.getPosition().getEndLine() : 0;
 
@@ -181,7 +197,12 @@ public class SpoonAnalyzer {
             meta.put("namespace", ownerType.getPackage() != null ? ownerType.getPackage().getQualifiedName() : "");
             sym.set("metadata", meta);
             symbols.add(sym);
+            // Bug 1 fix: method → owning class MEMBER_OF edge
+            addRelationship(relationships, methodFqn, ownerFqn, "member_of");
         }
+
+        // Method-level annotations → ANNOTATED_BY
+        addAnnotationEdges(method.getAnnotations(), methodFqn, relationships);
 
         // Return type → USES_TYPE
         if (method.getType() != null) {
@@ -217,11 +238,18 @@ public class SpoonAnalyzer {
                         }
                     }
 
-                    if (exec != null && exec.getDeclaringType() != null) {
-                        String targetClass = exec.getDeclaringType().getQualifiedName();
-                        if (!isExternalType(targetClass)) {
-                            String callee = targetClass + "." + exec.getSimpleName();
-                            addRelationship(relationships, methodFqn, callee, "calls");
+                    // Bug 6 fix: fallback to target expression type when declaringType is null
+                    if (exec != null) {
+                        CtTypeReference<?> declType = exec.getDeclaringType();
+                        if (declType == null && invocation.getTarget() != null) {
+                            try { declType = invocation.getTarget().getType(); } catch (Exception ignored) {}
+                        }
+                        if (declType != null) {
+                            String targetClass = declType.getQualifiedName();
+                            if (!isExternalType(targetClass)) {
+                                String callee = targetClass + "." + exec.getSimpleName();
+                                addRelationship(relationships, methodFqn, callee, "calls");
+                            }
                         }
                     }
                     super.visitCtInvocation(invocation);
@@ -247,7 +275,124 @@ public class SpoonAnalyzer {
         }
     }
 
+    // Bug 3 fix: process constructors as first-class symbols
+    private static void processConstructor(CtConstructor<?> ctor, String ownerFqn, String filePath,
+                                            ArrayNode symbols, ArrayNode relationships,
+                                            Set<String> seen, CtType<?> ownerType) {
+        String paramSig = ctor.getParameters().stream()
+            .map(p -> p.getType().getSimpleName())
+            .collect(Collectors.joining(","));
+        String ctorFqn = ownerFqn + ".<init>(" + paramSig + ")";
+        if (seen.contains(ctorFqn)) return;
+        seen.add(ctorFqn);
+
+        int startLine = ctor.getPosition().isValidPosition() ? ctor.getPosition().getLine() : 0;
+        int endLine = ctor.getPosition().isValidPosition() ? ctor.getPosition().getEndLine() : 0;
+
+        ObjectNode sym = mapper.createObjectNode();
+        sym.put("name", ctorFqn);
+        sym.put("node_type", "constructor");
+        sym.put("content", ownerType.getSimpleName() + "(" + paramSig + ")");
+        sym.put("start_line", startLine);
+        sym.put("end_line", endLine);
+        sym.put("start_byte", 0);
+        sym.put("end_byte", 0);
+        ObjectNode meta = mapper.createObjectNode();
+        meta.put("file_path", "/src/" + filePath);
+        meta.put("namespace", ownerType.getPackage() != null ? ownerType.getPackage().getQualifiedName() : "");
+        sym.set("metadata", meta);
+        symbols.add(sym);
+        addRelationship(relationships, ctorFqn, ownerFqn, "member_of");
+
+        // Constructor-level annotations → ANNOTATED_BY
+        addAnnotationEdges(ctor.getAnnotations(), ctorFqn, relationships);
+
+        // Parameter types → USES_TYPE
+        for (CtParameter<?> param : ctor.getParameters()) {
+            collectUserDefinedTypes(param.getType()).forEach(t ->
+                addRelationship(relationships, ctorFqn, t, "uses_type"));
+        }
+
+        // Body → CALLS (Bug 6 fix applied here too)
+        if (ctor.getBody() != null) {
+            ctor.getBody().accept(new CtScanner() {
+                @Override
+                public <T> void visitCtInvocation(CtInvocation<T> invocation) {
+                    CtExecutableReference<?> exec = invocation.getExecutable();
+                    if (exec != null) {
+                        CtTypeReference<?> declType = exec.getDeclaringType();
+                        if (declType == null && invocation.getTarget() != null) {
+                            try { declType = invocation.getTarget().getType(); } catch (Exception ignored) {}
+                        }
+                        if (declType != null) {
+                            String targetClass = declType.getQualifiedName();
+                            if (!isExternalType(targetClass)) {
+                                String callee = targetClass + "." + exec.getSimpleName();
+                                addRelationship(relationships, ctorFqn, callee, "calls");
+                            }
+                        }
+                    }
+                    super.visitCtInvocation(invocation);
+                }
+            });
+        }
+    }
+
+    // Bug 2 fix: process fields as first-class symbols
+    private static void processField(CtField<?> field, String ownerFqn, String filePath,
+                                      ArrayNode symbols, ArrayNode relationships,
+                                      Set<String> seen, CtType<?> ownerType) {
+        String fieldFqn = ownerFqn + "." + field.getSimpleName();
+        if (seen.contains(fieldFqn)) return;
+        seen.add(fieldFqn);
+
+        int startLine = field.getPosition().isValidPosition() ? field.getPosition().getLine() : 0;
+
+        ObjectNode sym = mapper.createObjectNode();
+        sym.put("name", fieldFqn);
+        sym.put("node_type", "field");
+        sym.put("content", field.getSimpleName());
+        sym.put("start_line", startLine);
+        sym.put("end_line", startLine);
+        sym.put("start_byte", 0);
+        sym.put("end_byte", 0);
+        ObjectNode meta = mapper.createObjectNode();
+        meta.put("file_path", "/src/" + filePath);
+        meta.put("namespace", ownerType.getPackage() != null ? ownerType.getPackage().getQualifiedName() : "");
+        sym.set("metadata", meta);
+        symbols.add(sym);
+        addRelationship(relationships, fieldFqn, ownerFqn, "member_of");
+
+        // Field-level annotations → ANNOTATED_BY (@Autowired, @Column, @Id, custom, ...)
+        addAnnotationEdges(field.getAnnotations(), fieldFqn, relationships);
+
+        // Field type → USES_TYPE
+        if (field.getType() != null) {
+            collectUserDefinedTypes(field.getType()).forEach(t ->
+                addRelationship(relationships, fieldFqn, t, "uses_type"));
+        }
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    /**
+     * Emit ANNOTATED_BY edges for all non-external annotations on a code element.
+     * Skips standard Java/Spring/Lombok annotations — only tracks user-defined
+     * and project-local annotations (custom @interface types).
+     */
+    private static void addAnnotationEdges(Collection<CtAnnotation<?>> annotations,
+                                            String sourceFqn, ArrayNode relationships) {
+        for (CtAnnotation<?> ann : annotations) {
+            try {
+                String annFqn = ann.getAnnotationType().getQualifiedName();
+                if (!isExternalType(annFqn)) {
+                    addRelationship(relationships, sourceFqn, annFqn, "annotated_by");
+                }
+            } catch (Exception ignored) {
+                // noClasspath mode may fail to resolve annotation type
+            }
+        }
+    }
 
     private static List<String> collectUserDefinedTypes(CtTypeReference<?> ref) {
         if (ref == null) return Collections.emptyList();
