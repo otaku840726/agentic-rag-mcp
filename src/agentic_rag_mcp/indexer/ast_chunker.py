@@ -168,8 +168,12 @@ class TreeSitterAnalyzer(BaseAnalyzer):
         top-level declarations (functions, classes, definitions).
         """
         if content is None:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+            try:
+                with open(file_path, 'r', encoding='utf-8-sig') as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                with open(file_path, 'r', encoding='utf-16') as f:
+                    content = f.read()
 
         ext = os.path.splitext(file_path)[1].lower()
         _ensure_ts()
