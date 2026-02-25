@@ -785,6 +785,23 @@ class IndexerService:
             h.update(f"{path}:{file_hashes[path]}\n".encode())
         return h.hexdigest()
 
+    @staticmethod
+    def _dir_hash(dir_path: Path) -> str:
+        """Compute MD5 of every file under dir_path (sorted for determinism).
+        Used to detect analyzer source changes so AuraDB is re-analyzed even
+        when the project's own source files haven't changed."""
+        h = hashlib.md5()
+        try:
+            for f in sorted(dir_path.rglob("*")):
+                if f.is_file():
+                    try:
+                        h.update(f.read_bytes())
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        return h.hexdigest()
+
     def _is_excluded(self, file_path: Path) -> bool:
         """Whitelist-based filtering.
 
@@ -882,13 +899,24 @@ class IndexerService:
             pom_files = [p for p in current_files
                          if p.endswith("pom.xml") or p.lower().endswith("build.gradle")]
 
+            # Pre-compute analyzer source hashes so that changing SpoonAnalyzer.java
+            # or RoslynAnalyzer source invalidates stored AuraDB hashes even when
+            # the project's own source files haven't changed.
+            _analyzers_root = Path(__file__).parent.parent / "analyzers"
+            _csharp_analyzer_hash = self._dir_hash(_analyzers_root / "csharp")
+            _java_analyzer_hash   = self._dir_hash(_analyzers_root / "java")
+
             for sln_path in sln_files:
                 sln_dir = str(Path(sln_path).parent)
                 constituent = {
                     p: h for p, h in current_files.items()
                     if p.startswith(sln_dir) and p.lower().endswith(".cs")
                 }
-                agg = self._aggregate_hash(constituent)
+                # Mix in analyzer version so Roslyn rule changes trigger re-analysis
+                agg = self._aggregate_hash({
+                    **constituent,
+                    "__roslyn_analyzer__": _csharp_analyzer_hash,
+                })
                 if graph_hashes.get(sln_path) != agg:
                     solutions_changed.add(sln_path)
 
@@ -898,7 +926,11 @@ class IndexerService:
                     p: h for p, h in current_files.items()
                     if p.startswith(pom_dir) and p.lower().endswith(".java")
                 }
-                agg = self._aggregate_hash(constituent)
+                # Mix in analyzer version so Spoon rule changes trigger re-analysis
+                agg = self._aggregate_hash({
+                    **constituent,
+                    "__spoon_analyzer__": _java_analyzer_hash,
+                })
                 if graph_hashes.get(pom_path) != agg:
                     solutions_changed.add(pom_path)
 

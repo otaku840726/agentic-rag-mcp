@@ -21,3 +21,7 @@ COPY --from=build /app .
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
+
+# Injected at build time by DockerAnalyzer auto-rebuild logic.
+ARG SOURCE_HASH=unknown
+LABEL source_hash=$SOURCE_HASH

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
 
 logger = logging.getLogger(__name__)
@@ -92,8 +93,10 @@ class AnalyzerFactory:
                 "~/.m2/repository:/root/.m2/repository"
             )
             extra_volumes = [m2_cache] if m2_cache else []
-            return DockerAnalyzer(image=image, command_template=command, extra_volumes=extra_volumes)
-        
+            _java_src = str(Path(__file__).parent.parent / "analyzers" / "java")
+            return DockerAnalyzer(image=image, command_template=command,
+                                  extra_volumes=extra_volumes, source_dir=_java_src)
+
         elif analyzer_type == AnalyzerType.ROSLYN:
             # Use Docker analyzer with Roslyn image
             from .docker_analyzer import DockerAnalyzer
@@ -105,7 +108,9 @@ class AnalyzerFactory:
                 "~/.nuget/packages:/root/.nuget/packages"
             )
             extra_volumes = [nuget_cache] if nuget_cache else []
-            return DockerAnalyzer(image=image, command_template=command, extra_volumes=extra_volumes)
+            _csharp_src = str(Path(__file__).parent.parent / "analyzers" / "csharp")
+            return DockerAnalyzer(image=image, command_template=command,
+                                  extra_volumes=extra_volumes, source_dir=_csharp_src)
         
         else:
             # Fallback to tree-sitter

@@ -20,3 +20,8 @@ RUN chmod +x /entrypoint.sh
 #   -v ~/.m2/repository:/root/.m2/repository \
 #   agentic-rag-spoon-analyzer:latest /src/pom.xml
 ENTRYPOINT ["/entrypoint.sh"]
+
+# Injected at build time by DockerAnalyzer auto-rebuild logic.
+# Stores a hash of all source files so the next run can detect changes.
+ARG SOURCE_HASH=unknown
+LABEL source_hash=$SOURCE_HASH
