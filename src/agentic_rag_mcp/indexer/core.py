@@ -135,6 +135,18 @@ EXT_CATEGORY_MAP = {
     ".css":        ("source-code", "css"),
     ".html":       ("documentation", None),
 
+    # ── HTML-based templates (server-side + SFC) ──
+    ".vue":        ("source-code", "javascript"),   # Vue SFC
+    ".svelte":     ("source-code", "javascript"),   # Svelte SFC
+    ".erb":        ("source-code", "ruby"),         # Ruby ERB
+    ".ejs":        ("source-code", "javascript"),   # EJS
+    ".jsp":        ("source-code", "java"),         # Java JSP
+    ".ftl":        ("source-code", "java"),         # Freemarker
+    ".twig":       ("source-code", "php"),          # Twig
+    ".njk":        ("source-code", "javascript"),   # Nunjucks
+    ".hbs":        ("source-code", "javascript"),   # Handlebars
+    ".mustache":   ("source-code", "javascript"),   # Mustache
+
     # ── Database ──
     ".sql":        ("database", None),
 

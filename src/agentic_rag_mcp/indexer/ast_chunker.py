@@ -56,7 +56,28 @@ _GRAMMAR_MAP: Dict[str, tuple] = {
     # ── Shell ──
     ".sh":         ("tree_sitter_bash",        "language"),
     ".bash":       ("tree_sitter_bash",        "language"),
+    # ── XML-derived ──
+    ".xaml":       ("tree_sitter_xml",         "language_xml"),  # MAUI/WPF UI
 }
+
+# Extensions that use the HTML parser via parse_html_template (three-layer strategy).
+# These are NOT in _GRAMMAR_MAP because they share the .html parser, not own grammars.
+_HTML_TEMPLATE_EXTS = frozenset({
+    # .NET
+    ".cshtml", ".razor",
+    # JS SFC
+    ".vue", ".svelte",
+    # Ruby
+    ".erb",
+    # JavaScript templates
+    ".ejs",
+    # Java
+    ".jsp", ".ftl",
+    # PHP / Python templates
+    ".twig", ".njk",
+    # Handlebars / Mustache
+    ".hbs", ".mustache",
+})
 
 
 def _ensure_ts():
@@ -183,9 +204,16 @@ class TreeSitterAnalyzer(BaseAnalyzer):
             chunks = parse_csharp(content, file_path)
         elif ext == '.java':
             chunks = parse_java(content, file_path)
+        elif ext in _HTML_TEMPLATE_EXTS:
+            # Universal three-layer parsing for HTML-based templates
+            chunks = parse_html_template(content, file_path)
         elif ext in _parsers:
             # Generic AST chunking for all other supported languages
             chunks = parse_generic(content, file_path, ext, _parsers[ext])
+
+        # Fallback: any whitelisted extension with no parser → whole-file chunk
+        if not chunks:
+            chunks = _whole_file_chunk(content, file_path, ext)
 
         # Parse the tree once more for enhanced relationship extraction (CS/Java only)
         tree_root = None
@@ -457,6 +485,182 @@ def _whole_file_chunk(content: str, file_path: str, ext: str) -> List[ASTChunk]:
         parent_class=None,
         namespace=None,
     )]
+
+
+# ── HTML-based template parser ────────────────────────────────────
+
+def _extract_html_element_name(node, lines: list, fname: str) -> str:
+    """Extract a meaningful name from an HTML element node.
+    Priority: id attribute → first class token → tag name → line fallback.
+    """
+    try:
+        start_tag = next((c for c in node.children if c.type == "start_tag"), None)
+        if start_tag is None:
+            return f"{fname}:line_{node.start_point[0] + 1}"
+
+        def _text(n) -> str:
+            return n.text.decode("utf-8") if isinstance(n.text, bytes) else (n.text or "")
+
+        tag_name = next((_text(c) for c in start_tag.children if c.type == "tag_name"), "element")
+
+        id_val = class_val = None
+        for attr in start_tag.children:
+            if attr.type != "attribute":
+                continue
+            attr_name = next((_text(c) for c in attr.children if c.type == "attribute_name"), "")
+            val_node  = next((c for c in attr.children if c.type == "attribute_value"), None)
+            if val_node is None:
+                continue
+            val = _text(val_node).strip("\"'")
+            if attr_name == "id" and not id_val:
+                id_val = val
+            elif attr_name == "class" and not class_val:
+                class_val = val.split()[0] if val else None
+
+        if id_val:
+            return f"{tag_name}#{id_val}"
+        if class_val:
+            return f"{tag_name}.{class_val}"
+        return tag_name
+    except Exception:
+        return f"{fname}:line_{node.start_point[0] + 1}"
+
+
+def _chunk_script_element(
+    script_node,
+    lines: list,
+    file_path: str,
+    js_parser,
+    outer_start: int,
+) -> List[ASTChunk]:
+    """Extract and semantically chunk a <script> block.
+
+    Tries JS tree-sitter re-parse for function/method-level chunks.
+    Falls back to the whole <script> block as one chunk.
+    """
+    fname = os.path.basename(file_path)
+
+    raw_text_node = next((c for c in script_node.children if c.type == "raw_text"), None)
+
+    if raw_text_node is not None and js_parser is not None:
+        try:
+            script_text = (
+                raw_text_node.text.decode("utf-8")
+                if isinstance(raw_text_node.text, bytes)
+                else raw_text_node.text
+            )
+            script_offset = raw_text_node.start_point[0]
+            js_chunks = parse_generic(script_text, file_path + ":script", ".js", js_parser)
+            if js_chunks:
+                for jc in js_chunks:
+                    jc.start_line += script_offset
+                    jc.end_line   += script_offset
+                    jc.node_type  = f"script:{jc.node_type}"
+                return js_chunks
+        except Exception as e:
+            logger.debug(f"JS re-parse of <script> failed for {file_path}: {e}")
+
+    # Fallback: whole <script> as one chunk
+    body = "\n".join(lines[outer_start:script_node.end_point[0] + 1])
+    if not body.strip():
+        return []
+    return [ASTChunk(
+        name=f"{fname}:script",
+        node_type="script_element",
+        content=body,
+        start_line=outer_start + 1,
+        end_line=script_node.end_point[0] + 1,
+    )]
+
+
+def parse_html_template(content: str, file_path: str) -> List[ASTChunk]:
+    """Universal parser for HTML-based template files.
+
+    Supports: Razor (.cshtml/.razor), Vue SFC (.vue), Svelte (.svelte),
+    ERB (.erb), EJS (.ejs), JSP (.jsp), Freemarker (.ftl),
+    Twig (.twig), Nunjucks (.njk), Handlebars (.hbs), Mustache (.mustache).
+
+    Three-layer strategy:
+      Layer 1 – Directives : leading non-HTML nodes before first <tag>
+                             (@model/@using, <%@ page %>, --- front-matter, etc.)
+      Layer 2 – Script     : each <script> block re-parsed with JS parser for
+                             semantic function/method chunking (Vue methods, jQuery, etc.)
+      Layer 3 – Style      : each <style> block as its own chunk
+      Layer 4 – HTML body  : remaining top-level <elements> as individual chunks
+    """
+    _ensure_ts()
+    html_parser = _parsers.get(".html")
+    if html_parser is None:
+        return _whole_file_chunk(content, file_path, "template")
+
+    try:
+        tree = html_parser.parse(bytes(content, "utf-8"))
+    except Exception as e:
+        logger.warning(f"HTML template parse failed for {file_path}: {e}")
+        return _whole_file_chunk(content, file_path, "template")
+
+    lines   = content.splitlines()
+    root    = tree.root_node
+    chunks: List[ASTChunk] = []
+    fname   = os.path.basename(file_path)
+    js_parser = _parsers.get(".js")
+
+    # ── Layer 1: leading non-HTML directive nodes ────────────────────
+    _HTML_NODE_TYPES = {"element", "script_element", "style_element", "doctype"}
+    directive_parts: List[str] = []
+    directive_end_line = 0
+
+    for child in root.children:
+        if child.type in _HTML_NODE_TYPES:
+            break
+        text = "\n".join(lines[child.start_point[0]:child.end_point[0] + 1]).strip()
+        if text:
+            directive_parts.append(text)
+            directive_end_line = child.end_point[0]
+
+    if directive_parts:
+        chunks.append(ASTChunk(
+            name=f"{fname}:directives",
+            node_type="template_directives",
+            content="\n".join(directive_parts),
+            start_line=1,
+            end_line=directive_end_line + 1,
+        ))
+
+    # ── Layers 2-4: script / style / element nodes ──────────────────
+    for child in root.children:
+        ctype = child.type
+        start = child.start_point[0]
+        end   = child.end_point[0]
+
+        if ctype == "script_element":
+            chunks.extend(_chunk_script_element(child, lines, file_path, js_parser, start))
+
+        elif ctype == "style_element":
+            body = "\n".join(lines[start:end + 1])
+            if body.strip():
+                chunks.append(ASTChunk(
+                    name=f"{fname}:style",
+                    node_type="style_element",
+                    content=body,
+                    start_line=start + 1,
+                    end_line=end + 1,
+                ))
+
+        elif ctype == "element":
+            body = "\n".join(lines[start:end + 1])
+            if not body.strip():
+                continue
+            name = _extract_html_element_name(child, lines, fname)
+            chunks.append(ASTChunk(
+                name=name,
+                node_type="html_element",
+                content=body,
+                start_line=start + 1,
+                end_line=end + 1,
+            ))
+
+    return chunks if chunks else _whole_file_chunk(content, file_path, "template")
 
 
 # ── Core parsing logic ────────────────────────────────────────────
