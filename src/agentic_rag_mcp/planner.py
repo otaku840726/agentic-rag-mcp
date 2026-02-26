@@ -276,15 +276,19 @@ class Planner:
 
 class LLMJudge:
     """
-    LLM Judge - 用於 is_satisfied 的不確定情況
+    LLM Judge - 語義判斷 missing evidence 是否被滿足
     極短輸出，只回答 true/false + 1句理由
     """
 
     def __init__(self, config: Optional[PlannerConfig] = None):
-        self.config = config or PlannerConfig(max_tokens=100)
-        client, comp_cfg = create_client_for("judge")
-        self.client = client
-        if not config:
+        if config:
+            from .provider import create_client
+            self.config = config
+            self.client = create_client(config.provider)
+        else:
+            self.config = PlannerConfig(max_tokens=150)
+            client, comp_cfg = create_client_for("judge")
+            self.client = client
             self.config.provider = comp_cfg.provider
             self.config.model = comp_cfg.model
             self.config.max_tokens = comp_cfg.max_tokens
@@ -295,16 +299,18 @@ class LLMJudge:
         need: str,
         accept: List[str],
         covered: List[str],
-        candidates_summary: str
+        candidates_summary: str,
+        usage_log: Optional[list] = None,
     ) -> Dict[str, Any]:
         """
-        判斷 missing evidence 是否被滿足
+        語義判斷單個 missing evidence 是否被滿足
 
         Args:
             need: 需要什麼
-            accept: 接受條件
-            covered: 已覆蓋的條件
-            candidates_summary: 候選卡片摘要
+            accept: 接受條件列表
+            covered: regex 已確認覆蓋的條件
+            candidates_summary: 相關證據卡片摘要（path + snippet）
+            usage_log: 效能追蹤列表
 
         Returns:
             {"satisfied": bool, "reason": str}
@@ -313,7 +319,7 @@ class LLMJudge:
 
 需求: {need}
 接受條件: {', '.join(accept)}
-已覆蓋: {', '.join(covered)}
+regex已覆蓋: {', '.join(covered) if covered else '無'}
 候選證據:
 {candidates_summary}
 
@@ -329,7 +335,19 @@ class LLMJudge:
         if self.config.provider != "local":
             kwargs["response_format"] = {"type": "json_object"}
 
+        import time
+        start_time = time.time()
         response = self.client.chat.completions.create(**kwargs)
+        latency = (time.time() - start_time) * 1000
+
+        if usage_log is not None and hasattr(response, "usage") and response.usage:
+            usage_log.append({
+                "component": "judge",
+                "model": self.config.model,
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "latency_ms": round(latency),
+            })
 
         try:
             content = response.choices[0].message.content

@@ -23,7 +23,7 @@ from .budget import StopConditionChecker
 from .hybrid_search import HybridSearch, HybridSearchBatch
 from .reranker import create_reranker
 from .analyst import Analyst, EnsembleAnalyst, AnalystConfig
-from .planner import Planner, PlannerConfig
+from .planner import Planner, PlannerConfig, LLMJudge
 from .synthesizer import Synthesizer, SynthesizerConfig
 from .search_logger import SearchTraceLogger
 from .provider import get_section_config, get_neo4j_config
@@ -83,13 +83,14 @@ class AgenticSearch:
         self.analyst = EnsembleAnalyst(config=llm_override.get("analyst"))
         self.planner = Planner(config=llm_override.get("planner"))
         self.synthesizer = Synthesizer(config=llm_override.get("synthesizer"))
+        self.judge = LLMJudge(config=llm_override.get("judge"))
         self.logger = SearchTraceLogger()
 
         # Optional: Graph search enhancer
         self._graph_enhancer = None
         self._graph_enhancer_checked = False
 
-        # 停機條件
+        # 停機條件（注入 judge 以啟用語義判斷）
         budget = Budget(
             max_iterations=self.config.max_iterations,
             total_token_budget=self.config.total_token_budget
@@ -100,7 +101,7 @@ class AgenticSearch:
             require_call_edge=self.config.require_call_edge,
             require_named_entity=self.config.require_named_entity
         )
-        self.stop_checker = StopConditionChecker(budget, quality_gate)
+        self.stop_checker = StopConditionChecker(budget, quality_gate, judge=self.judge)
 
     @property
     def graph_enhancer(self):
@@ -148,6 +149,7 @@ class AgenticSearch:
             "analyst": make("analyst", AnalystConfig),
             "planner": make("planner", PlannerConfig),
             "synthesizer": make("synthesizer", SynthesizerConfig),
+            "judge": make("judge", PlannerConfig),
         }
 
     @staticmethod
@@ -248,14 +250,20 @@ class AgenticSearch:
                 state.missing_evidence = plan.missing_evidence
                 iteration_info["missing_evidence"] = [m.need for m in plan.missing_evidence]
 
-                # Planner 判斷應該停止
+                # Planner 判斷應該停止 → 由 stop_checker + judge 獨立確認
                 if plan.should_stop:
-                    iteration_info["stop_reason"] = "planner_decided"
-                    debug_info["iterations"].append(iteration_info)
-                    
-                    # Log Iteration (Stop)
-                    self.logger.log_iteration(search_id, state.iteration, asdict(plan), iteration_info)
-                    break
+                    all_cards_now = self.evidence_store.get_all_cards()
+                    judge_agrees, judge_reason, _ = self.stop_checker.should_stop(
+                        state, all_cards_now, usage_log=usage_log
+                    )
+                    if judge_agrees:
+                        iteration_info["stop_reason"] = f"planner_decided+judge_confirmed({judge_reason})"
+                        debug_info["iterations"].append(iteration_info)
+                        self.logger.log_iteration(search_id, state.iteration, asdict(plan), iteration_info)
+                        break
+                    else:
+                        # Judge 不同意 → 繼續搜索，忽略 Planner 的 should_stop
+                        iteration_info["stop_reason"] = f"planner_overridden_by_judge({judge_reason})"
 
                 # 2. 執行搜索
                 queries_to_execute = plan.next_queries
@@ -319,7 +327,9 @@ class AgenticSearch:
 
                 # 5. 檢查停機條件
                 all_cards = self.evidence_store.get_all_cards()
-                should_stop, stop_reason, _ = self.stop_checker.should_stop(state, all_cards)
+                should_stop, stop_reason, _ = self.stop_checker.should_stop(
+                    state, all_cards, usage_log=usage_log
+                )
 
                 iteration_info["stop_reason"] = stop_reason if should_stop else None
                 debug_info["iterations"].append(iteration_info)

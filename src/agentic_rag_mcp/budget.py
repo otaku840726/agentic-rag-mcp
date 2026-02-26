@@ -2,11 +2,14 @@
 Budget & Quality Gate - 預算控制和質量門檻
 """
 
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, TYPE_CHECKING
 from dataclasses import dataclass
 
 from .models import EvidenceCard, MissingEvidence, SearchState, Budget, QualityGate
 from .utils import check_accept_coverage
+
+if TYPE_CHECKING:
+    from .planner import LLMJudge
 
 
 class BudgetManager:
@@ -94,41 +97,41 @@ class StopConditionChecker:
     def __init__(
         self,
         budget: Optional[Budget] = None,
-        quality_gate: Optional[QualityGate] = None
+        quality_gate: Optional[QualityGate] = None,
+        judge: Optional["LLMJudge"] = None,
     ):
         self.budget_manager = BudgetManager(budget)
         self.quality_checker = QualityGateChecker(quality_gate)
+        self.judge = judge
 
     def should_stop(
         self,
         state: SearchState,
-        evidence_cards: List[EvidenceCard]
+        evidence_cards: List[EvidenceCard],
+        usage_log: Optional[list] = None,
     ) -> Tuple[bool, str, List]:
         """
         檢查是否應該停止
         Returns: (should_stop, reason, fallback_queries)
         """
-        # 1. 預算檢查
+        # 1. 預算硬上限 — 無條件強制停止
         can_continue, reason = self.budget_manager.can_continue(state)
         if not can_continue:
             return True, reason, []
 
-        # 2. 所有 missing_evidence 都滿足 + 質量通過
+        # 2. 所有 missing_evidence 語義滿足（兩段式：regex → LLMJudge）
         all_satisfied = self._check_missing_evidence_satisfied(
-            state.missing_evidence, evidence_cards
+            state.missing_evidence, evidence_cards, usage_log=usage_log
         )
         if all_satisfied:
-            quality_passed, quality_reason = self.quality_checker.check(evidence_cards)
-            if quality_passed:
-                return True, "all_evidence_found_and_quality_passed", []
+            # quality gate 作為軟性參考；LLMJudge 已確認 → 直接停止
+            return True, "all_evidence_found_and_quality_passed", []
 
         # 3. Stuck 處理
         if state.consecutive_no_new == 1 and not state.fallback_triggered:
-            # 第一次 stuck → 觸發 fallback，不停止
             return False, "triggering_fallback", []
 
         if state.consecutive_no_new >= 2:
-            # 連續 2 次 stuck → 停止
             return True, "stuck_after_fallback", []
 
         return False, "", []
@@ -136,14 +139,15 @@ class StopConditionChecker:
     def _check_missing_evidence_satisfied(
         self,
         missing_evidence: List[MissingEvidence],
-        cards: List[EvidenceCard]
+        cards: List[EvidenceCard],
+        usage_log: Optional[list] = None,
     ) -> bool:
-        """檢查所有 missing evidence 是否滿足"""
+        """檢查所有 missing evidence 是否滿足（兩段式）"""
         if not missing_evidence:
             return True
 
         for m in missing_evidence:
-            if not self._is_satisfied(m, cards):
+            if not self._is_satisfied(m, cards, usage_log=usage_log):
                 return False
 
         return True
@@ -151,28 +155,63 @@ class StopConditionChecker:
     def _is_satisfied(
         self,
         missing: MissingEvidence,
-        cards: List[EvidenceCard]
+        cards: List[EvidenceCard],
+        usage_log: Optional[list] = None,
     ) -> bool:
         """
-        檢查單個 missing evidence 是否滿足
-        使用覆蓋率判斷
+        兩段式 missing evidence 滿足判斷：
+        Stage 1: regex 快速通道（無 LLM 成本）
+        Stage 2: regex 不確定時 → LLMJudge 語義判斷
         """
         if not missing.accept:
             return True
 
-        covered_count = 0
+        # Stage 1: regex 掃描所有卡片
+        covered_items: List[str] = []
         for item in missing.accept:
-            # 檢查是否有任何卡片滿足這個條件
             for card in cards:
-                covered = check_accept_coverage([item], card.chunk_text)
-                if covered:
-                    covered_count += 1
+                matched = check_accept_coverage([item], card.chunk_text)
+                if matched:
+                    covered_items.append(item)
                     break
 
-        coverage_rate = covered_count / len(missing.accept)
+        coverage_rate = len(covered_items) / len(missing.accept)
 
-        # 覆蓋率 >= 67% 視為滿足
+        # 明確滿足 (>= 67%) → 不需要 LLM
+        if coverage_rate >= 0.67:
+            return True
+
+        # regex 無法確認 → 交給 LLMJudge 語義判斷
+        if self.judge and cards:
+            summary = self._build_candidates_summary(missing, cards)
+            result = self.judge.judge(
+                need=missing.need,
+                accept=missing.accept,
+                covered=covered_items,
+                candidates_summary=summary,
+                usage_log=usage_log,
+            )
+            return bool(result.get("satisfied", False))
+
+        # 沒有 judge → 維持原本 67% 規則
         return coverage_rate >= 0.67
+
+    @staticmethod
+    def _build_candidates_summary(
+        missing: MissingEvidence,
+        cards: List[EvidenceCard],
+        top_k: int = 6,
+    ) -> str:
+        """
+        為 LLMJudge 建立候選證據摘要
+        優先挑選 rerank 分數高的卡片，每張截 200 字
+        """
+        sorted_cards = sorted(cards, key=lambda c: c.score_rerank, reverse=True)
+        lines = []
+        for c in sorted_cards[:top_k]:
+            snippet = c.chunk_text[:200].replace("\n", " ")
+            lines.append(f"[{c.path}] {snippet}")
+        return "\n".join(lines) if lines else "（無候選證據）"
 
     def add_tokens(self, count: int):
         """記錄 token 使用"""
