@@ -99,7 +99,8 @@ class Synthesizer:
         search_history: List[str],
         iterations: int,
         logger: Any = None,
-        search_id: str = ""
+        search_id: str = "",
+        usage_log: Optional[list] = None
     ) -> SynthesizedResponse:
         """
         整合證據生成最終回答
@@ -139,7 +140,16 @@ class Synthesizer:
 
         # 解析回應
         content = response.choices[0].message.content
-        
+
+        if usage_log is not None and hasattr(response, "usage") and response.usage:
+            usage_log.append({
+                "component": "synthesizer",
+                "model": self.config.model,
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "latency_ms": round(latency),
+            })
+
         # Log to trace if logger provided
         if logger and search_id:
             logger.log_llm_event(

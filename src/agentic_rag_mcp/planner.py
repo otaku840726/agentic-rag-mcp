@@ -108,7 +108,8 @@ class Planner:
         previous_missing: Optional[List[MissingEvidence]] = None,
         analyst_output: Optional[AnalystOutput] = None,
         logger: Any = None,
-        search_id: str = ""
+        search_id: str = "",
+        usage_log: Optional[list] = None
     ) -> PlannerOutput:
         """
         生成下一輪計劃
@@ -154,7 +155,16 @@ class Planner:
 
         # 解析回應
         content = response.choices[0].message.content
-        
+
+        if usage_log is not None and hasattr(response, "usage") and response.usage:
+            usage_log.append({
+                "component": f"planner_iter_{iteration}",
+                "model": self.config.model,
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "latency_ms": round(latency),
+            })
+
         # Log to trace if logger provided
         if logger and search_id:
             logger.log_llm_event(
@@ -165,7 +175,7 @@ class Planner:
                 response=content,
                 latency_ms=latency
             )
-            
+
         return self._parse_response(content)
 
     def _build_user_prompt(

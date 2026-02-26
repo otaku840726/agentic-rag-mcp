@@ -195,7 +195,20 @@ def format_response(result: SearchResult) -> str:
 
     # Metadata
     parts.append("\n---\n")
-    parts.append(f"*Iterations: {resp.iterations} | Evidence found: {resp.total_evidence_found}*")
+    meta = f"*Iterations: {resp.iterations} | Evidence found: {resp.total_evidence_found}"
+
+    perf = (result.debug_info or {}).get("perf_stats")
+    if perf:
+        elapsed_s = perf["elapsed_ms"] / 1000
+        meta += (
+            f" | Time: {elapsed_s:.1f}s"
+            f" | Tokens: {perf['total_tokens']:,}"
+            f" (in={perf['total_prompt_tokens']:,}"
+            f" / out={perf['total_completion_tokens']:,})"
+            f" | LLM calls: {perf['llm_calls']}"
+        )
+    meta += "*"
+    parts.append(meta)
 
     return "\n".join(parts)
 

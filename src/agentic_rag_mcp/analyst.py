@@ -90,7 +90,8 @@ class Analyst:
         evidence_summary: str,
         iteration: int,
         logger: Any = None,
-        search_id: str = ""
+        search_id: str = "",
+        usage_log: Optional[list] = None
     ) -> AnalystOutput:
         """
         對當前證據做全局分析
@@ -133,6 +134,15 @@ class Analyst:
             latency = (time.time() - start_time) * 1000
 
             content = response.choices[0].message.content
+
+            if usage_log is not None and hasattr(response, "usage") and response.usage:
+                usage_log.append({
+                    "component": f"analyst_iter_{iteration}",
+                    "model": self.config.model,
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "latency_ms": round(latency),
+                })
 
             # Log
             if logger and search_id:
@@ -336,7 +346,8 @@ class EnsembleAnalyst:
         evidence_summary: str,
         iteration: int,
         logger: Any = None,
-        search_id: str = ""
+        search_id: str = "",
+        usage_log: Optional[list] = None
     ) -> AnalystOutput:
         """並行跑 3 個 persona，合併結果"""
         if not self._enabled:
@@ -345,7 +356,8 @@ class EnsembleAnalyst:
                 evidence_summary=evidence_summary,
                 iteration=iteration,
                 logger=logger,
-                search_id=search_id
+                search_id=search_id,
+                usage_log=usage_log
             )
 
         outputs: List[tuple[str, AnalystOutput]] = []
@@ -377,6 +389,15 @@ class EnsembleAnalyst:
             latency = (time.time() - start_time) * 1000
 
             content = response.choices[0].message.content
+
+            if usage_log is not None and hasattr(response, "usage") and response.usage:
+                usage_log.append({
+                    "component": f"analyst_ensemble_{name}_iter_{iteration}",
+                    "model": analyst.config.model,
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "latency_ms": round(latency),
+                })
 
             if logger and search_id:
                 logger.log_llm_event(

@@ -4,6 +4,7 @@ Agentic Search - 主循環控制
 """
 
 import os
+import time
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field, asdict
 
@@ -185,7 +186,7 @@ class AgenticSearch:
         search_id = str(uuid.uuid4())
         state = SearchState(query=query)
         self.evidence_store.clear()
-        
+
         # Log Start
         self.logger.log_start(search_id, query, asdict(self.config))
 
@@ -195,6 +196,9 @@ class AgenticSearch:
             "search_history": [],
             "final_evidence_count": 0
         }
+
+        usage_log: list = []
+        search_start_time = time.time()
 
         try:
             # 主循環
@@ -216,7 +220,8 @@ class AgenticSearch:
                     evidence_summary=evidence_summary,
                     iteration=state.iteration,
                     logger=self.logger,
-                    search_id=search_id
+                    search_id=search_id,
+                    usage_log=usage_log
                 )
 
                 iteration_info["analyst"] = {
@@ -235,7 +240,8 @@ class AgenticSearch:
                     previous_missing=state.missing_evidence,
                     analyst_output=analyst_output,
                     logger=self.logger,
-                    search_id=search_id
+                    search_id=search_id,
+                    usage_log=usage_log
                 )
 
                 # 更新狀態
@@ -336,12 +342,26 @@ class AgenticSearch:
                 search_history=state.search_history,
                 iterations=state.iteration,
                 logger=self.logger,
-                search_id=search_id
+                search_id=search_id,
+                usage_log=usage_log
             )
 
             debug_info["search_history"] = state.search_history
             debug_info["final_evidence_count"] = len(all_evidence)
-            
+
+            # Aggregate performance stats
+            elapsed_ms = round((time.time() - search_start_time) * 1000)
+            total_prompt = sum(e.get("prompt_tokens", 0) for e in usage_log)
+            total_completion = sum(e.get("completion_tokens", 0) for e in usage_log)
+            debug_info["perf_stats"] = {
+                "elapsed_ms": elapsed_ms,
+                "total_prompt_tokens": total_prompt,
+                "total_completion_tokens": total_completion,
+                "total_tokens": total_prompt + total_completion,
+                "llm_calls": len(usage_log),
+                "breakdown": usage_log,
+            }
+
             # Log End
             self.logger.log_end(search_id, True, asdict(response))
 
