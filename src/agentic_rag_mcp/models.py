@@ -3,7 +3,7 @@ Data models for Agentic RAG
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any
 from enum import Enum
 
 
@@ -13,6 +13,11 @@ class SourceKind(str, Enum):
     CONFIG = "config"
     SQL = "sql"
     JIRA = "jira"
+
+
+class Phase(str, Enum):
+    ONE = "phase1"   # Anchor Hunting — broad queries, accept imprecision
+    TWO = "phase2"   # Anchor Expansion — precise graph traversal + tech-stack-aware
 
 
 class QueryOperator(str, Enum):
@@ -69,28 +74,6 @@ class MissingEvidence:
     accept: List[str]                          # ["config key", "default value", "where read"]
     priority: str                              # "high" | "medium" | "low"
 
-
-# ========== Analyst Output ==========
-@dataclass
-class AnalystOutput:
-    """Analyst 的結構化輸出"""
-    subject: str                               # 核心主題
-    actors: List[Dict[str, str]]               # [{"name": "...", "role": "..."}]
-    covered: List[str]                         # 已覆蓋的維度
-    gaps: List[str]                            # 未覆蓋的維度
-    reasoning: str = ""                        # 推理過程
-
-
-# ========== Planner Output ==========
-@dataclass
-class PlannerOutput:
-    """Planner 的結構化輸出"""
-    next_queries: List[QueryIntent]            # 下一輪要查什麼
-    missing_evidence: List[MissingEvidence]    # 還缺哪些關鍵證據
-    evidence_found: List[str]                  # 這輪找到哪些 (evidence card ids)
-    rationale: str                             # 決策理由 (簡短)
-    should_stop: bool = False                  # Planner 認為是否應該停止
-    symmetry_analysis: str = ""                # 對稱性思考結果（保留向後兼容）
 
 
 # ========== Evidence Reference ==========
@@ -158,7 +141,63 @@ class SearchState:
     consecutive_no_new: int = 0                # 連續無新發現次數
     search_history: List[str] = field(default_factory=list)
     missing_evidence: List[MissingEvidence] = field(default_factory=list)
+    symmetry_gaps: List[str] = field(default_factory=list)  # 跨輪次傳遞的對稱缺口
     fallback_triggered: bool = False           # 是否已觸發 fallback
+
+
+# ========== Investigation State (Blackboard) ==========
+@dataclass
+class InvestigationState:
+    """Blackboard — shared state for all Specialists in the new Coordinator architecture.
+    Superset of SearchState: all budget.py / stop_checker fields are preserved."""
+
+    # --- Original SearchState fields (keep for budget.py / StopConditionChecker) ---
+    query: str
+    iteration: int = 0
+    total_tokens: int = 0
+    consecutive_no_new: int = 0
+    search_history: List[str] = field(default_factory=list)
+    missing_evidence: List[MissingEvidence] = field(default_factory=list)
+    symmetry_gaps: List[str] = field(default_factory=list)
+    fallback_triggered: bool = False
+
+    # --- Phase tracking (written by AnchorDetector, read by all) ---
+    phase: Phase = field(default_factory=lambda: Phase.ONE)
+    anchors: List[str] = field(default_factory=list)
+
+    # --- Frame (written by SubjectAnalyst once at iteration=1) ---
+    subject: str = ""
+    actors: List[Dict[str, str]] = field(default_factory=list)
+
+    # --- Tech stack (written by TechStackInferrer once at Phase1→Phase2) ---
+    tech_stack: Optional[str] = None
+
+    # --- Per-iteration coverage (written by CoverageAnalyst) ---
+    covered: List[str] = field(default_factory=list)
+
+    # --- Impact reviewer persistent gaps (written by stop_checker, read by GapIdentifier) ---
+    # These are NOT overwritten by GapIdentifier — they persist until resolved.
+    impact_reviewer_gaps: List[str] = field(default_factory=list)
+
+    # --- One-time execution flags ---
+    subject_analyst_done: bool = False
+    tech_stack_inferred: bool = False
+
+    def to_debug_dict(self) -> Dict[str, Any]:
+        """Dump state for debug_info / iteration_info logging."""
+        return {
+            "phase": self.phase.value,
+            "anchors": self.anchors,
+            "tech_stack": self.tech_stack,
+            "subject": self.subject,
+            "actors": self.actors,
+            "covered": self.covered,
+            "symmetry_gaps": self.symmetry_gaps,
+            "missing_evidence": [
+                {"need": m.need, "priority": m.priority} for m in self.missing_evidence
+            ],
+            "impact_reviewer_gaps": self.impact_reviewer_gaps,
+        }
 
 
 # ========== Quality Gate ==========

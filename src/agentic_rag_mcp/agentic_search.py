@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field, asdict
 
 from .models import (
-    SearchResult, SynthesizedResponse, SearchState,
+    SearchResult, SynthesizedResponse, InvestigationState,
     EvidenceCard, QueryIntent, MissingEvidence,
     Budget, QualityGate
 )
@@ -22,11 +22,15 @@ from .query_builder import QueryBuilder
 from .budget import StopConditionChecker
 from .hybrid_search import HybridSearch, HybridSearchBatch
 from .reranker import create_reranker
-from .analyst import Analyst, EnsembleAnalyst, AnalystConfig
-from .planner import Planner, PlannerConfig, LLMJudge
+from .planner import LLMJudge
 from .synthesizer import Synthesizer, SynthesizerConfig
 from .search_logger import SearchTraceLogger
 from .provider import get_section_config, get_neo4j_config
+from .specialists import (
+    AnchorDetector, SubjectAnalyst, TechStackInferrer,
+    CoverageAnalyst, SymmetryChecker, GapIdentifier, QueryGenerator,
+    run_coverage_and_symmetry_parallel,
+)
 import uuid
 
 
@@ -60,12 +64,7 @@ class AgenticSearchConfig:
 class AgenticSearch:
     """自主搜索代理"""
 
-    def __init__(
-        self,
-        config: Optional[AgenticSearchConfig] = None,
-        llm_provider: Optional[str] = None,
-        llm_model: Optional[str] = None,
-    ):
+    def __init__(self, config: Optional[AgenticSearchConfig] = None):
         self.config = config or self._load_default_config()
 
         # 初始化組件
@@ -78,13 +77,19 @@ class AgenticSearch:
         self.batch_search = HybridSearchBatch(self.hybrid_search)
         self.reranker = create_reranker(self.config.use_cross_encoder)
 
-        # LLM 組件 — 可被 llm_provider / llm_model 覆蓋
-        llm_override = self._build_llm_configs(llm_provider, llm_model)
-        self.analyst = EnsembleAnalyst(config=llm_override.get("analyst"))
-        self.planner = Planner(config=llm_override.get("planner"))
-        self.synthesizer = Synthesizer(config=llm_override.get("synthesizer"))
-        self.judge = LLMJudge(config=llm_override.get("judge"))
+        # LLM 組件
+        self.synthesizer = Synthesizer()
+        self.judge = LLMJudge()
         self.logger = SearchTraceLogger()
+
+        # New Coordinator specialists
+        self.anchor_detector = AnchorDetector()
+        self.subject_analyst = SubjectAnalyst()
+        self.tech_stack_inferrer = TechStackInferrer()
+        self.coverage_analyst = CoverageAnalyst()
+        self.symmetry_checker = SymmetryChecker()
+        self.gap_identifier = GapIdentifier()
+        self.query_generator = QueryGenerator()
 
         # Optional: Graph search enhancer
         self._graph_enhancer = None
@@ -99,7 +104,7 @@ class AgenticSearch:
             min_code_evidence=self.config.min_code_evidence,
             min_tag_diversity=self.config.min_tag_diversity,
             require_call_edge=self.config.require_call_edge,
-            require_named_entity=self.config.require_named_entity
+            require_named_entity=self.config.require_named_entity,
         )
         self.stop_checker = StopConditionChecker(budget, quality_gate, judge=self.judge)
 
@@ -123,34 +128,6 @@ class AgenticSearch:
             except Exception:
                 pass
         return self._graph_enhancer
-
-    @staticmethod
-    def _build_llm_configs(
-        provider: Optional[str],
-        model: Optional[str],
-    ) -> Dict[str, Any]:
-        """當 llm_provider / llm_model 有值時，構建覆蓋各組件的 config 物件。
-        否則回傳空 dict，讓各組件從 config.yaml 讀取預設值。"""
-        if not provider and not model:
-            return {}
-
-        from .provider import get_component_config
-
-        def make(component: str, config_cls):
-            base = get_component_config(component)
-            return config_cls(
-                provider=provider or base.provider,
-                model=model or base.model,
-                max_tokens=base.max_tokens,
-                temperature=base.temperature,
-            )
-
-        return {
-            "analyst": make("analyst", AnalystConfig),
-            "planner": make("planner", PlannerConfig),
-            "synthesizer": make("synthesizer", SynthesizerConfig),
-            "judge": make("judge", PlannerConfig),
-        }
 
     @staticmethod
     def _load_default_config() -> AgenticSearchConfig:
@@ -186,7 +163,7 @@ class AgenticSearch:
         """
         # 初始化狀態
         search_id = str(uuid.uuid4())
-        state = SearchState(query=query)
+        state = InvestigationState(query=query)
         self.evidence_store.clear()
 
         # Log Start
@@ -215,58 +192,64 @@ class AgenticSearch:
                     "new_evidence": 0
                 }
 
-                # 1a. Analyst 全局分析
-                evidence_summary = self.evidence_store.get_summary_for_planner()
-                analyst_output = self.analyst.analyze(
-                    query=query,
-                    evidence_summary=evidence_summary,
-                    iteration=state.iteration,
-                    logger=self.logger,
-                    search_id=search_id,
-                    usage_log=usage_log
-                )
+                # ── Step 0: AnchorDetector (code) ──────────────────────────
+                all_cards_so_far = self.evidence_store.get_all_cards()
+                self.anchor_detector.detect(state, all_cards_so_far)
 
-                iteration_info["analyst"] = {
-                    "subject": analyst_output.subject,
-                    "actors": analyst_output.actors,
-                    "covered": analyst_output.covered,
-                    "gaps": analyst_output.gaps,
-                }
-
-                # 1b. Planner 根據 Analyst 分析生成查詢計劃
-                plan = self.planner.plan(
-                    query=query,
-                    evidence_summary=evidence_summary,
-                    search_history=state.search_history,
-                    iteration=state.iteration,
-                    previous_missing=state.missing_evidence,
-                    analyst_output=analyst_output,
-                    logger=self.logger,
-                    search_id=search_id,
-                    usage_log=usage_log
-                )
-
-                # 更新狀態
-                state.missing_evidence = plan.missing_evidence
-                iteration_info["missing_evidence"] = [m.need for m in plan.missing_evidence]
-
-                # Planner 判斷應該停止 → 由 stop_checker + judge 獨立確認
-                if plan.should_stop:
-                    all_cards_now = self.evidence_store.get_all_cards()
-                    judge_agrees, judge_reason, _ = self.stop_checker.should_stop(
-                        state, all_cards_now, usage_log=usage_log
+                # ── Step 1: SubjectAnalyst (once, before first search) ──────
+                if not state.subject_analyst_done:
+                    self.subject_analyst.analyze(
+                        state=state,
+                        usage_log=usage_log,
+                        logger_obj=self.logger,
+                        search_id=search_id,
                     )
-                    if judge_agrees:
-                        iteration_info["stop_reason"] = f"planner_decided+judge_confirmed({judge_reason})"
-                        debug_info["iterations"].append(iteration_info)
-                        self.logger.log_iteration(search_id, state.iteration, asdict(plan), iteration_info)
-                        break
-                    else:
-                        # Judge 不同意 → 繼續搜索，忽略 Planner 的 should_stop
-                        iteration_info["stop_reason"] = f"planner_overridden_by_judge({judge_reason})"
 
-                # 2. 執行搜索
-                queries_to_execute = plan.next_queries
+                # ── Step 2: TechStackInferrer (once, at Phase1→Phase2) ──────
+                if state.phase.value == "phase2" and not state.tech_stack_inferred:
+                    self.tech_stack_inferrer.infer(
+                        state=state,
+                        cards=all_cards_so_far,
+                        usage_log=usage_log,
+                        logger_obj=self.logger,
+                        search_id=search_id,
+                    )
+
+                # ── Step 3: CoverageAnalyst + SymmetryChecker (parallel) ────
+                evidence_summary = self.evidence_store.get_summary_for_planner()
+                run_coverage_and_symmetry_parallel(
+                    coverage_analyst=self.coverage_analyst,
+                    symmetry_checker=self.symmetry_checker,
+                    state=state,
+                    evidence_summary=evidence_summary,
+                    usage_log=usage_log,
+                    logger_obj=self.logger,
+                    search_id=search_id,
+                )
+
+                # ── Step 4: GapIdentifier ───────────────────────────────────
+                state.missing_evidence = self.gap_identifier.identify(
+                    state=state,
+                    usage_log=usage_log,
+                    logger_obj=self.logger,
+                    search_id=search_id,
+                )
+
+                # ── Step 5: QueryGenerator ──────────────────────────────────
+                queries_to_execute = self.query_generator.generate(
+                    state=state,
+                    usage_log=usage_log,
+                    logger_obj=self.logger,
+                    search_id=search_id,
+                )
+
+                # Log specialist outputs for this iteration
+                iteration_info["investigation_state"] = state.to_debug_dict()
+                iteration_info["missing_evidence"] = [m.need for m in state.missing_evidence]
+                if state.symmetry_gaps:
+                    iteration_info["symmetry_gaps"] = state.symmetry_gaps
+
+                # ── Step 6: Execute searches ────────────────────────────────
 
                 # 如果是 fallback 觸發
                 if state.consecutive_no_new == 1 and not state.fallback_triggered:
@@ -350,15 +333,19 @@ class AgenticSearch:
 
                 # 5. 檢查停機條件
                 all_cards = self.evidence_store.get_all_cards()
-                should_stop, stop_reason, _ = self.stop_checker.should_stop(
+                should_stop, stop_reason, supplementary = self.stop_checker.should_stop(
                     state, all_cards, usage_log=usage_log
                 )
+                # ImpactReviewer 指出的補充缺口 → 存入 impact_reviewer_gaps（獨立欄位，不被 GapIdentifier 覆蓋）
+                if not should_stop and supplementary and isinstance(supplementary[0], str):
+                    state.impact_reviewer_gaps = supplementary  # GapIdentifier 下輪會讀取
+                    iteration_info["impact_review_additions"] = supplementary
 
                 iteration_info["stop_reason"] = stop_reason if should_stop else None
                 debug_info["iterations"].append(iteration_info)
                 
                 # Log Iteration
-                self.logger.log_iteration(search_id, state.iteration, asdict(plan), iteration_info)
+                self.logger.log_iteration(search_id, state.iteration, state.to_debug_dict(), iteration_info)
 
                 if should_stop:
                     break

@@ -15,53 +15,53 @@ from .models import (
 from .utils import has_causal_verb, CAUSAL_VERBS, extract_json_from_response
 
 
-SYNTHESIZER_SYSTEM_PROMPT = """你是代碼庫專家。
-根據收集到的證據，生成結構化的回答。
+SYNTHESIZER_SYSTEM_PROMPT = """You are a codebase expert.
+Based on the collected evidence, generate a structured answer.
 
-**輸出格式 (JSON):**
+**Output format (JSON):**
 {
-    "answer": "結論摘要（2-3句話）",
+    "answer": "summary conclusion (2-3 sentences)",
     "flow": [
         {
             "step": 1,
-            "description": "步驟描述",
+            "description": "step description",
             "code_ref": "card_id | path | L120-L150"
         }
     ],
     "decision_points": [
         {
-            "condition": "條件描述",
-            "true_branch": "為真時的行為",
-            "false_branch": "為假時的行為",
+            "condition": "condition description",
+            "true_branch": "behavior when true",
+            "false_branch": "behavior when false",
             "code_ref": "card_id | path | span"
         }
     ],
     "config": [
         {
-            "key": "配置鍵名",
-            "default_value": "預設值（如有）",
-            "source": "來源文件",
-            "description": "說明"
+            "key": "config key name",
+            "default_value": "default value (if any)",
+            "source": "source file path",
+            "description": "description"
         }
     ],
     "evidence": [
         {
             "card_id": "id",
-            "path": "文件路徑",
+            "path": "file path",
             "span": "L120-L150",
-            "quote": "關鍵引用（120-200字）",
+            "quote": "key excerpt (120-200 chars)",
             "needs_expand": false
         }
     ]
 }
 
-**要求:**
-1. answer 要簡潔但完整
-2. flow 按實際執行順序排列
-3. decision_points 列出關鍵分支邏輯
-4. config 列出相關配置項
-5. evidence 引用具體代碼，quote 控制在 120-200 字
-6. 所有引用必須來自提供的證據，不要臆測
+**Requirements:**
+1. answer must be concise but complete
+2. flow must be in actual execution order
+3. decision_points must list key branching logic
+4. config must list all relevant configuration items
+5. evidence must reference specific code; quote must be 120-200 characters
+6. all references must come from the provided evidence — do not speculate
 """
 
 
@@ -177,14 +177,14 @@ class Synthesizer:
     ) -> str:
         """構建用戶提示"""
         parts = [
-            f"**問題:** {query}",
+            f"**Question:** {query}",
             "",
-            "**收集到的證據:**",
+            "**Collected Evidence:**",
             ""
         ]
 
-        for i, card in enumerate(evidence_cards[:30]):  # 最多 30 張卡
-            parts.append(f"--- 證據 {i+1} ---")
+        for i, card in enumerate(evidence_cards[:30]):  # max 30 cards
+            parts.append(f"--- Evidence {i+1} ---")
             parts.append(f"ID: {card.id[:8]}")
             parts.append(f"Path: {card.path}")
             parts.append(f"Symbol: {card.symbol or '-'}")
@@ -192,13 +192,12 @@ class Synthesizer:
             parts.append(f"Tags: {', '.join(card.tags)}")
             parts.append(f"Score: {card.score_rerank:.2f}")
             parts.append(f"Content:")
-            # 控制內容長度
             content = card.chunk_text[:500] if len(card.chunk_text) > 500 else card.chunk_text
             parts.append(content)
             parts.append("")
 
         parts.append("---")
-        parts.append("請根據以上證據，生成結構化回答（JSON 格式）。")
+        parts.append("Based on the evidence above, generate a structured answer in JSON format.")
 
         return "\n".join(parts)
 
@@ -296,19 +295,19 @@ class Synthesizer:
 
         用於 needs_expand=True 的情況
         """
-        prompt = f"""從以下代碼中提取與問題相關的關鍵部分。
+        prompt = f"""Extract the most relevant parts of the following code with respect to the question.
 
-問題: {context_query}
+Question: {context_query}
 
-代碼內容:
+Code:
 {card.chunk_text}
 
-請提取最相關的 200-300 字內容，包含:
-1. 關鍵的函數/方法調用
-2. 狀態變更或配置讀取
-3. 條件判斷邏輯
+Extract the 200-300 most relevant characters, including:
+1. Key function/method calls
+2. State changes or configuration reads
+3. Conditional branching logic
 
-只輸出提取的內容，不要解釋。"""
+Output the extracted content only, no explanation."""
 
         response = self.client.chat.completions.create(
             model=self.config.model,

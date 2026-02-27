@@ -124,7 +124,23 @@ class StopConditionChecker:
             state.missing_evidence, evidence_cards, usage_log=usage_log
         )
         if all_satisfied:
-            # quality gate 作為軟性參考；LLMJudge 已確認 → 直接停止
+            # Fix B: 對稱性缺口仍存在時不允許停止
+            if state.symmetry_gaps:
+                return False, f"symmetry_gaps_pending({len(state.symmetry_gaps)})", []
+
+            # Fix D: AI 整體完整性確認（取代數字閥值）
+            if self.judge:
+                evidence_summary = self._build_evidence_summary(evidence_cards)
+                review = self.judge.review_completeness(
+                    query=state.query,
+                    evidence_summary=evidence_summary,
+                    usage_log=usage_log,
+                )
+                if not review.get("complete", True):
+                    missing_areas = review.get("missing_impact_areas", [])
+                    reason = review.get("reason", "")
+                    return False, f"impact_review_incomplete: {reason}", missing_areas
+
             return True, "all_evidence_found_and_quality_passed", []
 
         # 3. Stuck 處理
@@ -135,6 +151,20 @@ class StopConditionChecker:
             return True, "stuck_after_fallback", []
 
         return False, "", []
+
+    @staticmethod
+    def _build_evidence_summary(cards: List[EvidenceCard], top_k: int = 15) -> str:
+        """
+        為 ImpactReviewer 建立簡潔的證據摘要
+        取 rerank 分數最高的 top_k 張，每張取 path + snippet
+        """
+        sorted_cards = sorted(cards, key=lambda c: c.score_rerank, reverse=True)
+        lines = []
+        for c in sorted_cards[:top_k]:
+            symbol_part = f" [{c.symbol}]" if c.symbol else ""
+            snippet = c.snippet[:120].replace("\n", " ")
+            lines.append(f"- {c.path}{symbol_part}: {snippet}")
+        return "\n".join(lines) if lines else "（無證據）"
 
     def _check_missing_evidence_satisfied(
         self,
