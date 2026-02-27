@@ -187,12 +187,13 @@ class Synthesizer:
             parts.append(f"--- Evidence {i+1} ---")
             parts.append(f"ID: {card.id[:8]}")
             parts.append(f"Path: {card.path}")
+            parts.append(f"Span: {card.span}")
             parts.append(f"Symbol: {card.symbol or '-'}")
             parts.append(f"Source: {card.source_kind}")
             parts.append(f"Tags: {', '.join(card.tags)}")
             parts.append(f"Score: {card.score_rerank:.2f}")
             parts.append(f"Content:")
-            content = card.chunk_text[:500] if len(card.chunk_text) > 500 else card.chunk_text
+            content = card.chunk_text[:2000] if len(card.chunk_text) > 2000 else card.chunk_text
             parts.append(content)
             parts.append("")
 

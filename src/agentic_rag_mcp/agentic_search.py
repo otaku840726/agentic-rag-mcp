@@ -480,10 +480,15 @@ class AgenticSearch:
             payload = r.get("payload", {})
             symbol = payload.get("symbol") or payload.get("class_name") or payload.get("method_name")
 
-            # 構建 span
-            chunk_index = payload.get("chunk_index", 0)
-            total_chunks = payload.get("total_chunks", 1)
-            span = f"chunk {chunk_index + 1}/{total_chunks}"
+            # 構建 span：優先使用實際行號，fallback 到 chunk offset
+            start_line = payload.get("start_line")
+            end_line = payload.get("end_line")
+            if start_line and end_line:
+                span = f"L{start_line}-L{end_line}"
+            else:
+                chunk_index = payload.get("chunk_index", 0)
+                total_chunks = payload.get("total_chunks", 1)
+                span = f"chunk {chunk_index + 1}/{total_chunks}"
 
             cards.append(EvidenceCard(
                 id=r.get("id", ""),

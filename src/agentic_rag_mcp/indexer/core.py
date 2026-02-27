@@ -602,7 +602,7 @@ class IndexerService:
                             "extension": original_path.suffix,
                             "chunk_index": start_idx + i,
                             "total_chunks": len(symbols),
-                            "content_preview": content[:500],
+                            "content_preview": content,
                             "symbol_name": sym.get("name"),
                             "symbol_type": sym.get("node_type"),
                             "category": "source-code"
@@ -1071,7 +1071,7 @@ class IndexerService:
                         "extension": ext,
                         "chunk_index": i,
                         "total_chunks": len(symbols),
-                        "content_preview": content[:500],
+                        "content_preview": content,
                         "symbol_name": sym.get("name"),
                         "symbol_type": sym.get("node_type"),
                         "category": EXT_CATEGORY_MAP.get(ext, ("other", None))[0],
