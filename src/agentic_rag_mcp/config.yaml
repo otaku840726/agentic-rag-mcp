@@ -99,12 +99,6 @@ judge:
   temperature: ${JUDGE_TEMPERATURE:-0}
 
 # ============================================================
-# Ensemble Analyst
-# ============================================================
-ensemble:
-  enabled: ${ENSEMBLE_ENABLED:-true}   # true = 3-persona parallel, false = single analyst fallback
-
-# ============================================================
 # Budget & Quality
 # ============================================================
 budget:

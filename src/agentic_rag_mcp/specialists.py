@@ -447,10 +447,11 @@ Impact framework (check each dimension for RELEVANCE, then COVERAGE):
 Rules:
 1. For each dimension, FIRST decide: is it RELEVANT to this query? If not relevant → skip it entirely.
 2. If relevant AND not covered AND not already in symmetry_gaps → add to missing_evidence.
-3. Convert each item in symmetry_gaps into a high-priority missing_evidence entry.
-4. Output AT MOST 3 missing_evidence items. Prioritize the dimensions most likely to contain named code anchors.
-5. Do NOT generate search queries. Only describe what is needed.
-6. Do NOT repeat items already fully covered.
+3. Carry-over rule: High-priority items from the 'Previous round' MUST be included in 'missing_evidence' if they are not yet marked as covered. Do NOT drop them just because you have new information.
+4. Convert each item in symmetry_gaps into a high-priority missing_evidence entry.
+5. Output AT MOST 3 missing_evidence items. Prioritize the dimensions most likely to contain named code anchors.
+6. Do NOT generate search queries. Only describe what is needed.
+7. Do NOT repeat items already fully covered.
 """
 
 

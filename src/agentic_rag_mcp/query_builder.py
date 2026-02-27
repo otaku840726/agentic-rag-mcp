@@ -118,8 +118,11 @@ class QueryBuilder:
         queries = []
         variants = build_keyword_variants(intent.query)
 
-        # 根據 operator 決定查詢方式
-        if intent.operator == "exact":
+        # 根據 operator 或 query_type 決定查詢方式
+        is_graph_fallback = intent.query_type.startswith("graph_traverse")
+
+        if intent.operator == "exact" or is_graph_fallback:
+            # Graph fallback: treat it as exact symbol match in payload/content
             queries.append({
                 "query": intent.query,
                 "operator": "exact",

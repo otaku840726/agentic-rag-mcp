@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, asdict
 from .models import (
     SearchResult, SynthesizedResponse, InvestigationState,
     EvidenceCard, QueryIntent, MissingEvidence,
-    Budget, QualityGate
+    Budget, QualityGate, Phase
 )
 from .utils import (
     compute_fingerprint, extract_named_entities,
@@ -206,7 +206,7 @@ class AgenticSearch:
                     )
 
                 # ── Step 2: TechStackInferrer (once, at Phase1→Phase2) ──────
-                if state.phase.value == "phase2" and not state.tech_stack_inferred:
+                if state.phase == Phase.TWO and not state.tech_stack_inferred:
                     self.tech_stack_inferrer.infer(
                         state=state,
                         cards=all_cards_so_far,

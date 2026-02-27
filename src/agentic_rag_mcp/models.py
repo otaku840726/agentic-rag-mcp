@@ -131,27 +131,12 @@ class SynthesizedResponse:
     total_evidence_found: int                  # 總共找到的證據數
 
 
-# ========== Search State ==========
-@dataclass
-class SearchState:
-    """搜索狀態"""
-    query: str                                 # 原始查詢
-    iteration: int = 0                         # 當前迭代次數
-    total_tokens: int = 0                      # 已消耗 token
-    consecutive_no_new: int = 0                # 連續無新發現次數
-    search_history: List[str] = field(default_factory=list)
-    missing_evidence: List[MissingEvidence] = field(default_factory=list)
-    symmetry_gaps: List[str] = field(default_factory=list)  # 跨輪次傳遞的對稱缺口
-    fallback_triggered: bool = False           # 是否已觸發 fallback
-
-
 # ========== Investigation State (Blackboard) ==========
 @dataclass
 class InvestigationState:
-    """Blackboard — shared state for all Specialists in the new Coordinator architecture.
-    Superset of SearchState: all budget.py / stop_checker fields are preserved."""
+    """Blackboard — shared state for all Specialists in the new Coordinator architecture."""
 
-    # --- Original SearchState fields (keep for budget.py / StopConditionChecker) ---
+    # --- Search & Budget control (read by budget.py) ---
     query: str
     iteration: int = 0
     total_tokens: int = 0
@@ -161,7 +146,7 @@ class InvestigationState:
     symmetry_gaps: List[str] = field(default_factory=list)
     fallback_triggered: bool = False
 
-    # --- Phase tracking (written by AnchorDetector, read by all) ---
+    # --- Phase tracking (written by AnchorDetector) ---
     phase: Phase = field(default_factory=lambda: Phase.ONE)
     anchors: List[str] = field(default_factory=list)
 

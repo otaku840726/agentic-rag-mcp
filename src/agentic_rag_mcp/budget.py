@@ -5,7 +5,7 @@ Budget & Quality Gate - 預算控制和質量門檻
 from typing import List, Tuple, Optional, TYPE_CHECKING
 from dataclasses import dataclass
 
-from .models import EvidenceCard, MissingEvidence, SearchState, Budget, QualityGate
+from .models import EvidenceCard, MissingEvidence, InvestigationState, Budget, QualityGate
 from .utils import check_accept_coverage
 
 if TYPE_CHECKING:
@@ -19,7 +19,7 @@ class BudgetManager:
         self.budget = budget or Budget()
         self.tokens_used = 0
 
-    def can_continue(self, state: SearchState) -> Tuple[bool, str]:
+    def can_continue(self, state: InvestigationState) -> Tuple[bool, str]:
         """檢查是否可以繼續"""
         if state.iteration >= self.budget.max_iterations:
             return False, "max_iterations_reached"
@@ -106,7 +106,7 @@ class StopConditionChecker:
 
     def should_stop(
         self,
-        state: SearchState,
+        state: InvestigationState,
         evidence_cards: List[EvidenceCard],
         usage_log: Optional[list] = None,
     ) -> Tuple[bool, str, List]:
