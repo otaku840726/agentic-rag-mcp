@@ -54,6 +54,16 @@ PLANNER_SYSTEM_PROMPT = """你是代碼庫搜索 Planner。
 - exact: 精確匹配，適合類名、方法名
 - symbol_ref: 符號引用搜索
 - callsite: 調用點搜索，如 "methodName("
+- graph_traverse_callers: 圖譜遍歷 — 找「誰調用了此方法/類」(query = 符號名稱)
+- graph_traverse_callees: 圖譜遍歷 — 找「此方法/類調用了什麼」(query = 符號名稱)
+- graph_traverse_implementations: 圖譜遍歷 — 找「誰實現了此接口」(query = 接口名稱)
+- graph_traverse_inherits: 圖譜遍歷 — 找「此類繼承自什麼」(query = 類名稱)
+
+**何時使用圖譜遍歷:**
+- 已找到某個方法/類，但不知道「誰在調用它」→ graph_traverse_callers
+- 需要追蹤一個方法的完整執行路徑（下游調用）→ graph_traverse_callees
+- 找到一個接口（IXxxService）但需要定位具體實現 → graph_traverse_implementations
+- operator 欄位固定填 "graph_traverse"，query 填精確的符號名稱
 
 **Accept 條件常見類型:**
 - "config key": 配置鍵名

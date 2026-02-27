@@ -107,6 +107,79 @@ class GraphSearchEnhancer:
         )
         return supplementary[:top_k]
 
+    def traverse_direct(
+        self,
+        symbol: str,
+        direction: str = "callers",
+        top_k: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Directly traverse the graph for a specific symbol + direction.
+
+        Args:
+            symbol: Symbol name or FQN to start from
+            direction: "callers" (who calls this), "callees" (what this calls),
+                       "implementations" (who implements this interface),
+                       "inherits" (what this class inherits)
+            top_k: Max supplementary results to return
+
+        Returns:
+            List of search result dicts (same format as HybridSearch results)
+        """
+        _direction_map = {
+            "callers":          (["CALLS"],      "incoming"),
+            "callees":          (["CALLS"],      "outgoing"),
+            "implementations":  (["IMPLEMENTS"], "incoming"),
+            "inherits":         (["INHERITS"],   "outgoing"),
+            "implements":       (["IMPLEMENTS"], "outgoing"),
+        }
+
+        rel_types, neo4j_dir = _direction_map.get(direction, (["CALLS"], "incoming"))
+
+        try:
+            result = self.graph.get_neighbors(
+                symbol,
+                depth=1,
+                direction=neo4j_dir,
+                relationship_types=rel_types,
+            )
+        except Exception as e:
+            logger.debug(f"Graph traverse failed for {symbol} ({direction}): {e}")
+            return []
+
+        neighbor_files: Dict[str, float] = {}
+        for node in result.get("nodes", []):
+            fp = node.get("file_path")
+            kind = node.get("kind", "")
+            if not fp or kind == "external":
+                continue
+            neighbor_files[fp] = neighbor_files.get(fp, 0) + 1.0
+
+        if not neighbor_files:
+            return []
+
+        sorted_files = sorted(neighbor_files.items(), key=lambda x: -x[1])
+        supplementary = []
+        for file_path, _score in sorted_files[:top_k]:
+            try:
+                results = self.search.search_by_file_path(file_path, limit=2)
+                for r in results:
+                    supplementary.append({
+                        "path": r.get("path", file_path),
+                        "content": r.get("content", ""),
+                        "score": r.get("score", 0.0),
+                        "score_hybrid": r.get("score_hybrid", 0.0),
+                        "payload": r.get("payload", {}),
+                        "source": f"graph_{direction}",
+                    })
+            except Exception as e:
+                logger.debug(f"Qdrant fetch failed for graph traverse {file_path}: {e}")
+
+        logger.info(
+            f"Graph traverse ({direction}): {symbol!r} -> "
+            f"{len(neighbor_files)} neighbor files -> {len(supplementary)} results"
+        )
+        return supplementary[:top_k]
+
     def _extract_symbols(self, evidence_cards: List["EvidenceCard"]) -> List[str]:
         """Extract high-confidence symbol names from evidence cards.
 

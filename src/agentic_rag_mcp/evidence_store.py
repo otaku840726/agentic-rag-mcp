@@ -179,24 +179,35 @@ class EvidenceStore:
     def get_summary_for_planner(self) -> str:
         """
         給 Planner 的固定格式摘要
-        每張卡一行，不含完整 snippet
+        每張卡一行，包含 symbol、named_entities（config_keys/enums）、round_found 與 150 字摘要
         """
         working_set = self.get_working_set()
 
         if not working_set:
             return "No evidence collected yet."
 
-        lines = ["card_id | path | symbol | tags | summary | score"]
-        lines.append("-" * 80)
+        lines = ["card_id | path | symbol | tags | entities | rnd | summary | score"]
+        lines.append("-" * 100)
 
         for card in working_set:
-            summary = card.snippet[:50] + "..." if len(card.snippet) > 50 else card.snippet
+            # 150 字摘要（原本是 50 字）
+            summary = card.snippet[:150] + "..." if len(card.snippet) > 150 else card.snippet
             summary = summary.replace('\n', ' ').replace('|', '/')
+
             tags_str = ','.join(card.tags[:3]) if card.tags else '-'
+
+            # 從 named_entities 提取關鍵實體（最多 3 個）
+            entities: List[str] = []
+            if card.named_entities:
+                for ent_list in card.named_entities.values():
+                    if isinstance(ent_list, list):
+                        entities.extend(ent_list)
+            entities_str = ','.join(entities[:3]) if entities else '-'
 
             lines.append(
                 f"{card.id[:8]} | {card.path[-40:]} | {card.symbol or '-'} | "
-                f"{tags_str} | {summary} | {card.score_rerank:.2f}"
+                f"{tags_str} | {entities_str} | r{card.round_found} | "
+                f"{summary} | {card.score_rerank:.2f}"
             )
 
         return "\n".join(lines)

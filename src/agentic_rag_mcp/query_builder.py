@@ -242,18 +242,23 @@ class QueryBuilder:
         missing_evidence: List[Any]
     ) -> List[QueryIntent]:
         """
-        生成 fallback 查詢 - 查已知的鄰居
+        生成 fallback 查詢 - 兩層策略：
+        Layer A: 傳統鄰居查詢（callsite / config key）
+        Layer B: Step-back — 從當前符號退後到 Controller/Route/Handler 入口
         """
         queries = []
         seen_queries = set()
 
-        # 1. 從 snippet 提取方法名，查 callsite
+        # ── Layer A: 傳統鄰居查詢 ──────────────────────────────
+
+        # A1. 從 snippet 提取方法名，查 callsite
         method_pattern = r'\b(\w{4,})\s*\('
+        _skip_keywords = {'if', 'while', 'for', 'switch', 'catch', 'return', 'throw',
+                          'await', 'async', 'using', 'foreach', 'public', 'private'}
         for card in evidence_cards[:10]:
             methods = re.findall(method_pattern, card.snippet)
             for m in methods:
-                # 過濾常見關鍵字
-                if m.lower() in ['if', 'while', 'for', 'switch', 'catch', 'return', 'throw']:
+                if m.lower() in _skip_keywords:
                     continue
                 if m not in seen_queries:
                     seen_queries.add(m)
@@ -264,7 +269,7 @@ class QueryBuilder:
                         query_type="callsite"
                     ))
 
-        # 2. 從 named_entities 提取 config key
+        # A2. 從 named_entities 提取 config key
         for card in evidence_cards[:10]:
             for key in card.named_entities.get("config_keys", [])[:2]:
                 if key not in seen_queries:
@@ -276,7 +281,43 @@ class QueryBuilder:
                         query_type="config"
                     ))
 
-        # 3. 根據缺失的證據類型決定 fallback 方向
+        # ── Layer B: Step-back — 退後到 API 入口層 ─────────────
+        # 策略：提取現有證據中最高分的 symbol，搜索其對應的
+        # Controller / Route / Handler / HttpPost / HttpGet / ApiController
+
+        step_back_done = False
+        if evidence_cards and not step_back_done:
+            # 取最高 rerank 分數的卡片的 symbol 或文件路徑關鍵詞
+            top_cards = sorted(evidence_cards, key=lambda c: c.score_rerank, reverse=True)[:3]
+            for card in top_cards:
+                # 提取最可能的業務關鍵詞（優先用 symbol，否則從路徑提取模塊名）
+                anchor = card.symbol
+                if not anchor and card.path:
+                    # 從路徑取文件名去掉擴展名
+                    parts = card.path.replace('\\', '/').split('/')
+                    fname = parts[-1] if parts else ''
+                    anchor = re.sub(r'\.(cs|py|java|ts|js)$', '', fname, flags=re.IGNORECASE)
+
+                if anchor and f"stepback_{anchor}" not in seen_queries:
+                    seen_queries.add(f"stepback_{anchor}")
+                    # 搜索以此 anchor 為核心的 Controller / API 入口
+                    queries.append(QueryIntent(
+                        query=f"{anchor} Controller HttpPost HttpGet Route",
+                        purpose=f"step-back: find API entry point for {anchor}",
+                        operator="keyword",
+                        query_type="keyword"
+                    ))
+                    # 同時嘗試語義搜索入口層
+                    queries.append(QueryIntent(
+                        query=f"API endpoint handler for {anchor} request",
+                        purpose=f"step-back: semantic search for {anchor} entry",
+                        operator="semantic",
+                        query_type="semantic"
+                    ))
+                    step_back_done = True
+                    break
+
+        # A3. 根據 missing_evidence 的 need 類型做特化 fallback
         for m in missing_evidence:
             need_lower = m.need.lower()
             if 'timeout' in need_lower and 'timeout' not in seen_queries:
@@ -295,13 +336,5 @@ class QueryBuilder:
                     operator="semantic",
                     query_type="symbol"
                 ))
-            if 'entry' in need_lower and 'entry' not in seen_queries:
-                seen_queries.add('entry')
-                queries.append(QueryIntent(
-                    query="handler endpoint controller",
-                    purpose="find entry points",
-                    operator="semantic",
-                    query_type="symbol"
-                ))
 
-        return queries[:5]  # 最多 5 個
+        return queries[:7]  # 增加上限（原本 5 → 7）以容納 step-back 查詢

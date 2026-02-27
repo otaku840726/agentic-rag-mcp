@@ -278,19 +278,42 @@ class AgenticSearch:
                     state.fallback_triggered = True
                     iteration_info["fallback_triggered"] = True
 
-                # 構建實際查詢
+                # 構建實際查詢 — 分流：圖譜遍歷 vs 向量/關鍵字搜索
                 all_queries = []
+                graph_traverse_results: List[Dict[str, Any]] = []
+
                 for intent in queries_to_execute:
-                    built = self.query_builder.build_from_intent(intent)
-                    all_queries.extend(built)
                     state.search_history.append(intent.query)
                     iteration_info["queries"].append(intent.query)
 
-                # 批量搜索
+                    # 圖譜遍歷：直接派發給 GraphSearchEnhancer
+                    if intent.query_type.startswith("graph_traverse") and self.graph_enhancer:
+                        direction = intent.query_type.replace("graph_traverse_", "")
+                        try:
+                            gr = self.graph_enhancer.traverse_direct(
+                                symbol=intent.query,
+                                direction=direction,
+                                top_k=10,
+                            )
+                            graph_traverse_results.extend(gr)
+                            iteration_info.setdefault("graph_traverse", []).append(
+                                {"symbol": intent.query, "direction": direction, "found": len(gr)}
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        built = self.query_builder.build_from_intent(intent)
+                        all_queries.extend(built)
+
+                # 批量向量/關鍵字搜索
                 raw_results = self.batch_search.search_batch(
                     all_queries,
                     top_n_per_query=self.config.top_n_search // len(all_queries) if all_queries else 50
                 )
+
+                # 合併圖譜遍歷結果
+                if graph_traverse_results:
+                    raw_results = raw_results + graph_traverse_results
                 iteration_info["results_found"] = len(raw_results)
 
                 # 3. Rerank
@@ -355,6 +378,24 @@ class AgenticSearch:
                 search_id=search_id,
                 usage_log=usage_log
             )
+
+            # Post-process: expand evidence refs that lack causal context
+            card_map = {c.id: c for c in all_evidence}
+            card_map.update({c.id[:8]: c for c in all_evidence})
+            expand_count = 0
+            for ev_ref in response.evidence:
+                if ev_ref.needs_expand:
+                    card = card_map.get(ev_ref.card_id) or card_map.get(ev_ref.card_id[:8])
+                    if card:
+                        try:
+                            expanded = self.synthesizer.expand_evidence(card, query)
+                            ev_ref.quote = expanded
+                            ev_ref.needs_expand = False
+                            expand_count += 1
+                        except Exception:
+                            pass  # Best-effort: keep original quote on failure
+            if expand_count:
+                debug_info["evidence_expanded"] = expand_count
 
             debug_info["search_history"] = state.search_history
             debug_info["final_evidence_count"] = len(all_evidence)

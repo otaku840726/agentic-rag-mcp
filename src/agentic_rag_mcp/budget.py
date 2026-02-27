@@ -204,12 +204,34 @@ class StopConditionChecker:
     ) -> str:
         """
         為 LLMJudge 建立候選證據摘要
-        優先挑選 rerank 分數高的卡片，每張截 200 字
+        策略：先按與 missing.need / missing.accept 的關鍵字重疊度排序，
+        再按 rerank 分數兜底，取 top_k 張，每張截 250 字
         """
-        sorted_cards = sorted(cards, key=lambda c: c.score_rerank, reverse=True)
+        import re
+
+        # 從 need 和 accept 中提取關鍵詞（長度 >= 3 的非停用詞）
+        _stopwords = {"the", "a", "an", "is", "in", "of", "and", "or", "for",
+                      "to", "with", "how", "what", "where", "when", "which"}
+        need_tokens = set(re.findall(r'\w{3,}', missing.need.lower())) - _stopwords
+        accept_tokens: set = set()
+        for item in missing.accept:
+            accept_tokens.update(re.findall(r'\w{3,}', item.lower()))
+        accept_tokens -= _stopwords
+        query_tokens = need_tokens | accept_tokens
+
+        def _relevance_score(card: EvidenceCard) -> float:
+            """關鍵字重疊度 (0-1) + rerank 分數加成"""
+            if not query_tokens:
+                return card.score_rerank
+            text_lower = card.chunk_text.lower()
+            matched = sum(1 for t in query_tokens if t in text_lower)
+            overlap = matched / len(query_tokens)
+            return overlap * 0.7 + card.score_rerank * 0.3
+
+        sorted_cards = sorted(cards, key=_relevance_score, reverse=True)
         lines = []
         for c in sorted_cards[:top_k]:
-            snippet = c.chunk_text[:200].replace("\n", " ")
+            snippet = c.chunk_text[:250].replace("\n", " ")
             lines.append(f"[{c.path}] {snippet}")
         return "\n".join(lines) if lines else "（無候選證據）"
 
