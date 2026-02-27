@@ -148,8 +148,14 @@ Rules:
 class SubjectAnalyst:
     """Runs once at iteration=1. Establishes the investigation frame (subject + actors)."""
 
-    def __init__(self):
+    def __init__(self, provider: Optional[str] = None, model: Optional[str] = None):
         self._client, self._cfg = create_client_for("analyst")
+        if provider:
+            from .provider import create_client
+            self._cfg.provider = provider
+            self._client = create_client(provider)
+        if model:
+            self._cfg.model = model
 
     def analyze(
         self,
@@ -218,8 +224,14 @@ Rules:
 class TechStackInferrer:
     """Runs once at Phase1→Phase2 transition. Infers tech stack from Phase1 evidence."""
 
-    def __init__(self):
+    def __init__(self, provider: Optional[str] = None, model: Optional[str] = None):
         self._client, self._cfg = create_client_for("analyst")
+        if provider:
+            from .provider import create_client
+            self._cfg.provider = provider
+            self._client = create_client(provider)
+        if model:
+            self._cfg.model = model
 
     def infer(
         self,
@@ -294,8 +306,14 @@ Rules:
 class CoverageAnalyst:
     """Per-iteration. Identifies what is covered. Runs parallel with SymmetryChecker."""
 
-    def __init__(self):
+    def __init__(self, provider: Optional[str] = None, model: Optional[str] = None):
         self._client, self._cfg = create_client_for("analyst")
+        if provider:
+            from .provider import create_client
+            self._cfg.provider = provider
+            self._client = create_client(provider)
+        if model:
+            self._cfg.model = model
 
     def analyze(
         self,
@@ -372,8 +390,14 @@ Rules:
 class SymmetryChecker:
     """Per-iteration. Checks data/operation symmetry for known anchors. Runs parallel with CoverageAnalyst."""
 
-    def __init__(self):
+    def __init__(self, provider: Optional[str] = None, model: Optional[str] = None):
         self._client, self._cfg = create_client_for("analyst")
+        if provider:
+            from .provider import create_client
+            self._cfg.provider = provider
+            self._client = create_client(provider)
+        if model:
+            self._cfg.model = model
 
     def check(
         self,
@@ -458,8 +482,14 @@ Rules:
 class GapIdentifier:
     """Per-iteration. Combines coverage + symmetry + impact framework to identify what's missing."""
 
-    def __init__(self):
+    def __init__(self, provider: Optional[str] = None, model: Optional[str] = None):
         self._client, self._cfg = create_client_for("planner")
+        if provider:
+            from .provider import create_client
+            self._cfg.provider = provider
+            self._client = create_client(provider)
+        if model:
+            self._cfg.model = model
 
     def identify(
         self,
@@ -585,8 +615,14 @@ Rules:
 class QueryGenerator:
     """Per-iteration. Converts missing_evidence into concrete QueryIntent objects."""
 
-    def __init__(self):
+    def __init__(self, provider: Optional[str] = None, model: Optional[str] = None):
         self._client, self._cfg = create_client_for("planner")
+        if provider:
+            from .provider import create_client
+            self._cfg.provider = provider
+            self._client = create_client(provider)
+        if model:
+            self._cfg.model = model
 
     def generate(
         self,

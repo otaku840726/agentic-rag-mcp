@@ -58,14 +58,27 @@ class AgenticSearchConfig:
     # Reranker
     use_cross_encoder: bool = True
 
+    # LLM overrides
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
+
     # LLM models are now configured in config.yaml (planner/synthesizer sections)
 
 
 class AgenticSearch:
     """自主搜索代理"""
 
-    def __init__(self, config: Optional[AgenticSearchConfig] = None):
+    def __init__(
+        self,
+        config: Optional[AgenticSearchConfig] = None,
+        llm_provider: Optional[str] = None,
+        llm_model: Optional[str] = None,
+    ):
         self.config = config or self._load_default_config()
+        if llm_provider:
+            self.config.llm_provider = llm_provider
+        if llm_model:
+            self.config.llm_model = llm_model
 
         # 初始化組件
         self.evidence_store = EvidenceStore(
@@ -78,18 +91,35 @@ class AgenticSearch:
         self.reranker = create_reranker(self.config.use_cross_encoder)
 
         # LLM 組件
-        self.synthesizer = Synthesizer()
-        self.judge = LLMJudge()
+        p, m = self.config.llm_provider, self.config.llm_model
+        
+        # Initialize Synthesizer with overrides if present
+        synth_cfg = None
+        if p or m:
+            synth_cfg = SynthesizerConfig()
+            if p: synth_cfg.provider = p
+            if m: synth_cfg.model = m
+        self.synthesizer = Synthesizer(config=synth_cfg)
+
+        # Initialize Judge with overrides if present
+        judge_cfg = None
+        if p or m:
+            from .planner import PlannerConfig
+            judge_cfg = PlannerConfig()
+            if p: judge_cfg.provider = p
+            if m: judge_cfg.model = m
+        self.judge = LLMJudge(config=judge_cfg)
+
         self.logger = SearchTraceLogger()
 
-        # New Coordinator specialists
+        # New Coordinator specialists with overrides
         self.anchor_detector = AnchorDetector()
-        self.subject_analyst = SubjectAnalyst()
-        self.tech_stack_inferrer = TechStackInferrer()
-        self.coverage_analyst = CoverageAnalyst()
-        self.symmetry_checker = SymmetryChecker()
-        self.gap_identifier = GapIdentifier()
-        self.query_generator = QueryGenerator()
+        self.subject_analyst = SubjectAnalyst(provider=p, model=m)
+        self.tech_stack_inferrer = TechStackInferrer(provider=p, model=m)
+        self.coverage_analyst = CoverageAnalyst(provider=p, model=m)
+        self.symmetry_checker = SymmetryChecker(provider=p, model=m)
+        self.gap_identifier = GapIdentifier(provider=p, model=m)
+        self.query_generator = QueryGenerator(provider=p, model=m)
 
         # Optional: Graph search enhancer
         self._graph_enhancer = None
