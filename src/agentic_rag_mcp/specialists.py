@@ -212,12 +212,13 @@ Output JSON only, no explanation.
 }
 
 Rules:
-- Infer from file extensions (.cs → .NET, .java → Java, .py → Python)
-- Infer from import/using statements and annotations
-- Infer from framework patterns: [HttpPost] → ASP.NET, @PostMapping → Spring, @router.post → FastAPI
-- Infer from library patterns: IConsumer<T> → EasyNetQ, @KafkaListener → Spring Kafka
-- Be specific: include framework and key library names, not just the language
+- Infer from file extensions (e.g., .cs → .NET, .java → Java, .py → Python, .go → Go, .ts → TypeScript — non-exhaustive)
+- Infer from import/using/require statements and build files (e.g., go.mod, package.json, pom.xml, build.gradle)
+- Infer from framework patterns (e.g., [HttpPost] → ASP.NET, @PostMapping → Spring, @router.post → FastAPI — use your full knowledge of all frameworks)
+- Infer from library patterns visible in imports or annotations
+- Be specific: include the framework and key library names, not just the language
 - If uncertain about a library, omit it rather than guess wrong
+- These examples are non-exhaustive — apply your full knowledge of any programming language or framework you encounter
 """
 
 
@@ -476,6 +477,17 @@ Rules:
 5. Output AT MOST 3 missing_evidence items. Prioritize the dimensions most likely to contain named code anchors.
 6. Do NOT generate search queries. Only describe what is needed.
 7. Do NOT repeat items already fully covered.
+
+Evidence Lock — dead-end detection (STRICT):
+8. "Already searched needs" lists requirements that were already searched in a previous iteration.
+   If a need from "Previous round" semantically matches any item in "Already searched needs"
+   AND it is NOT present in "Currently covered" → it is a DEAD-END. DO NOT re-add it.
+9. If a specific technical artifact (e.g., a particular method call, annotation, decorator, or config key)
+   was searched but not found, assume it does NOT exist in this codebase — the framework or runtime
+   may handle it implicitly (e.g., via conventions, defaults, or declarative mechanisms). DROP that requirement entirely.
+10. Exception to rules 8-9: if the current iteration's evidence contains a NEW concrete clue
+    (a class name, annotation, or method call) that specifically points to the dead-end item,
+    you MAY re-add it with an explanation in the 'need' field.
 """
 
 
@@ -518,6 +530,12 @@ class GapIdentifier:
             if state.impact_reviewer_gaps else "None."
         )
 
+        # Already searched needs — Evidence Lock: dead-ends to avoid re-pursuing
+        searched_needs_str = (
+            "\n".join(f"- {n}" for n in state.searched_needs)
+            if state.searched_needs else "None."
+        )
+
         user_prompt = (
             f"Query: {state.query}\n"
             f"Subject: {state.subject}\n"
@@ -525,6 +543,7 @@ class GapIdentifier:
             f"Currently covered:\n{covered_str}\n\n"
             f"Symmetry gaps:\n{sym_str}\n\n"
             f"Previous round's missing evidence (still pursuing if not covered):\n{prev_missing_str}\n\n"
+            f"Already searched needs (Evidence Lock — dead-ends if not now covered):\n{searched_needs_str}\n\n"
             f"⚠️ Mandatory gaps from impact reviewer (must include if not covered):\n{impact_gaps_str}\n\n"
             "Identify missing evidence and output JSON."
         )
@@ -598,10 +617,18 @@ PHASE 1 strategy (no anchors yet, tech_stack unknown):
 
 PHASE 2 strategy (anchors available, tech_stack known):
 - Use precise anchor-based queries with known anchor symbols
-- Apply tech-stack-specific patterns from the provided tech_stack context:
-  .NET: look for I{Service} IMPLEMENTS, [HttpPost] controllers, IConsumer<T>
-  Spring: look for @Autowired, @KafkaListener, @PostMapping
-  Python/FastAPI: look for Depends(), @router.post, Celery tasks
+- Queries MUST reference actual code artifacts: class names, method names, annotations,
+  decorators, function signatures, import paths — NOT generic framework documentation concepts.
+  Good query examples: "ProfileService @Cacheable", "IDepositService Find", "router.post deposit",
+                       "WalletService.debit callers", "@EventListener OrderCreated"
+  Bad query examples:  "Spring cache configuration", "dependency injection best practices",
+                       "REST API design pattern", "event-driven architecture"
+- Apply framework-specific search patterns based on the identified tech_stack value.
+  Use your knowledge of that language/framework to know the correct syntax for:
+  entry points (routing decorators/annotations/registrations for that framework),
+  dependency injection (interface naming conventions, injection annotations/decorators),
+  async/messaging (listener annotations, subscriber decorators, handler function signatures).
+  These patterns vary by tech_stack — derive them from what you know, do not guess if unsure.
 - Prefer graph traversal when you have a specific symbol name
 - For remaining semantic needs: use query_type "semantic" or "keyword"
 

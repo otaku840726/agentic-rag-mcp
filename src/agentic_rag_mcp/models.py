@@ -164,6 +164,10 @@ class InvestigationState:
     # These are NOT overwritten by GapIdentifier — they persist until resolved.
     impact_reviewer_gaps: List[str] = field(default_factory=list)
 
+    # --- Evidence Lock: needs already searched in a previous iteration ---
+    # Accumulated after each iteration. GapIdentifier uses this to avoid dead-end loops.
+    searched_needs: List[str] = field(default_factory=list)
+
     # --- One-time execution flags ---
     subject_analyst_done: bool = False
     tech_stack_inferred: bool = False
@@ -182,6 +186,7 @@ class InvestigationState:
                 {"need": m.need, "priority": m.priority} for m in self.missing_evidence
             ],
             "impact_reviewer_gaps": self.impact_reviewer_gaps,
+            "searched_needs": self.searched_needs,
         }
 
 

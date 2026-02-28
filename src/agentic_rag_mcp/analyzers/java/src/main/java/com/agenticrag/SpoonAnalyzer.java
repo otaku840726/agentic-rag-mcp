@@ -379,18 +379,37 @@ public class SpoonAnalyzer {
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     /**
-     * Emit ANNOTATED_BY edges for all non-external annotations on a code element.
-     * Skips standard Java/Spring/Lombok annotations — only tracks user-defined
-     * and project-local annotations (custom @interface types).
+     * Emit ANNOTATED_BY edges for annotations on a code element.
+     *
+     * Uses the annotation's simple name as the target identifier. This is intentional:
+     * in noClasspath mode, Spoon cannot reliably resolve annotation FQNs from external
+     * libraries (e.g. @RestController gets a synthetic FQN using the source file's package).
+     * Using simple names ensures consistent, queryable annotation nodes regardless of
+     * whether the annotation is from Spring, Lombok, or user-defined code.
+     *
+     * Skips noise-only annotations: Java built-ins (@Override, @SuppressWarnings, etc.)
+     * and Lombok field/data annotations that add no architectural signal.
      */
+    private static final Set<String> ANNOTATION_SKIP_LIST = Set.of(
+        "Override", "SuppressWarnings", "Deprecated", "FunctionalInterface", "SafeVarargs",
+        "SneakyThrows", "Getter", "Setter", "EqualsAndHashCode", "ToString",
+        "AllArgsConstructor", "NoArgsConstructor", "RequiredArgsConstructor",
+        "Builder", "Data", "Value", "With",
+        "Column", "JoinColumn", "Id", "GeneratedValue", "Transient", "Enumerated",
+        "SerializedName", "Expose", "JsonIgnore", "JsonProperty",
+        "CsvBindByName", "CsvCustomBindByName", "CsvDate",
+        "ApiIgnore", "ApiParam", "ApiOperation", "ApiModel", "ApiModelProperty"
+    );
+
     private static void addAnnotationEdges(Collection<CtAnnotation<?>> annotations,
                                             String sourceFqn, ArrayNode relationships) {
         for (CtAnnotation<?> ann : annotations) {
             try {
-                String annFqn = ann.getAnnotationType().getQualifiedName();
-                if (!isExternalType(annFqn)) {
-                    addRelationship(relationships, sourceFqn, annFqn, "annotated_by");
-                }
+                String simpleName = ann.getAnnotationType().getSimpleName();
+                if (simpleName == null || simpleName.isEmpty()) continue;
+                if (ANNOTATION_SKIP_LIST.contains(simpleName)) continue;
+                // Use simple name as target fqn — consistent across noClasspath resolution
+                addRelationship(relationships, sourceFqn, simpleName, "annotated_by");
             } catch (Exception ignored) {
                 // noClasspath mode may fail to resolve annotation type
             }

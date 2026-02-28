@@ -273,6 +273,14 @@ class AgenticSearch:
                     search_id=search_id,
                 )
 
+                # ── Evidence Lock: record searched needs ─────────────────────
+                # After QueryGenerator converts needs to queries, mark all current
+                # missing_evidence needs as "searched" so GapIdentifier can detect
+                # dead-ends in the next iteration.
+                for m in state.missing_evidence:
+                    if m.need and m.need not in state.searched_needs:
+                        state.searched_needs.append(m.need)
+
                 # Log specialist outputs for this iteration
                 iteration_info["investigation_state"] = state.to_debug_dict()
                 iteration_info["missing_evidence"] = [m.need for m in state.missing_evidence]
