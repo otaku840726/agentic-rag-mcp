@@ -364,6 +364,38 @@ if MCP_AVAILABLE:
                 }
             ),
             Tool(
+                name="clean-index",
+                description="""
+                Wipe all indexed data for the current project and start fresh.
+
+                What it clears:
+                  - Qdrant: deletes and recreates the entire collection (all points)
+                  - AuraDB: deletes all Symbol and File nodes for the current project only
+                    (AuraDB is shared; other projects are NOT affected)
+
+                Use this when you want to re-index from scratch, e.g. after changing
+                chunking settings, fixing annotation bugs, or switching codebases.
+
+                WARNING: This is irreversible. All indexed vectors and graph data
+                for this project will be permanently deleted.
+                Set confirm=true to proceed.
+                """,
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "confirm": {
+                            "type": "boolean",
+                            "description": "Must be true to proceed. Safety guard against accidental calls."
+                        },
+                        "project": {
+                            "type": "string",
+                            "description": "AuraDB project name to clear (defaults to GRAPH_PROJECT env var). Qdrant collection is always from QDRANT_COLLECTION env var."
+                        }
+                    },
+                    "required": ["confirm"]
+                }
+            ),
+            Tool(
                 name="debug-env",
                 description="Debug tool to check MCP server environment",
                 inputSchema={
@@ -573,6 +605,75 @@ if MCP_AVAILABLE:
             if "warning" in result:
                 slim["warning"] = result["warning"]
             return [TextContent(type="text", text=json.dumps(slim, indent=2, ensure_ascii=False))]
+
+        elif name == "clean-index":
+            if not arguments.get("confirm"):
+                return [TextContent(type="text", text=(
+                    "clean-index requires confirm=true. "
+                    "This will permanently delete all indexed data for this project."
+                ))]
+
+            project = arguments.get("project") or os.getenv("GRAPH_PROJECT", "default")
+            results = {}
+            errors = []
+
+            # ── Qdrant: delete + recreate collection ──────────────────
+            try:
+                from .indexer.qdrant_ops import QdrantOps
+                qdrant = QdrantOps()
+                collection = qdrant.collection_name
+                deleted = qdrant.delete_collection()
+                if deleted:
+                    # Recreate with the same settings as the original collection
+                    from .indexer.embedder import Embedder
+                    embedder = Embedder()
+                    dim = embedder.get_dimension()
+                    qdrant.create_collection(dimension=dim, recreate=False)
+                    results["qdrant"] = {
+                        "collection": collection,
+                        "status": "deleted and recreated"
+                    }
+                else:
+                    errors.append("Qdrant: delete_collection returned False")
+            except Exception as e:
+                errors.append(f"Qdrant error: {e}")
+                logger.exception("clean-index: Qdrant error")
+
+            # ── AuraDB: delete by project ──────────────────────────────
+            if _is_neo4j_enabled():
+                try:
+                    gs = get_graph_store()
+                    if gs is not None:
+                        graph_result = gs.delete_project(project=project)
+                        results["auradb"] = {
+                            "project": project,
+                            **graph_result,
+                            "status": "deleted"
+                        }
+                    else:
+                        errors.append("AuraDB: graph store unavailable")
+                except Exception as e:
+                    errors.append(f"AuraDB error: {e}")
+                    logger.exception("clean-index: AuraDB error")
+            else:
+                results["auradb"] = {"status": "skipped (Neo4j not enabled)"}
+
+            # ── Reset the graph store singleton so next call reconnects ─
+            global _graph_store
+            if _graph_store is not None:
+                try:
+                    _graph_store.close()
+                except Exception:
+                    pass
+                _graph_store = None
+
+            summary = {
+                "project": project,
+                "results": results,
+            }
+            if errors:
+                summary["errors"] = errors
+            return [TextContent(type="text", text=json.dumps(summary, indent=2))]
 
         elif name == "debug-env":
             import os

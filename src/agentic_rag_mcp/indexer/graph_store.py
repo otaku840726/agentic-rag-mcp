@@ -277,6 +277,46 @@ class GraphStore:
                 hash=hash,
             )
 
+    def delete_project(self, project: Optional[str] = None) -> Dict[str, int]:
+        """Delete ALL symbols, files, and relationships for a given project.
+
+        AuraDB is shared across projects. This method only removes nodes that
+        carry the matching project label, leaving other projects untouched.
+
+        Returns:
+            {"symbols_deleted": N, "files_deleted": M}
+        """
+        proj = project if project is not None else self.default_project
+        # Delete all Symbol nodes for the project (DETACH removes all their edges)
+        sym_query = """
+        MATCH (s:Symbol {project: $project})
+        WITH s, count(s) AS total
+        DETACH DELETE s
+        RETURN total
+        """
+        file_query = """
+        MATCH (f:File {project: $project})
+        WITH f, count(f) AS total
+        DETACH DELETE f
+        RETURN total
+        """
+        sym_deleted = 0
+        file_deleted = 0
+        with self.driver.session(database=self.database) as session:
+            result = session.run(sym_query, project=proj)
+            record = result.single()
+            if record:
+                sym_deleted = record["total"]
+            result = session.run(file_query, project=proj)
+            record = result.single()
+            if record:
+                file_deleted = record["total"]
+        logger.info(
+            f"Deleted project '{proj}' from graph: "
+            f"{sym_deleted} symbols, {file_deleted} files"
+        )
+        return {"symbols_deleted": sym_deleted, "files_deleted": file_deleted}
+
     def delete_by_file(self, file_path: str, project: Optional[str] = None):
         """Delete all symbols and relationships for a file (before re-indexing).
 
