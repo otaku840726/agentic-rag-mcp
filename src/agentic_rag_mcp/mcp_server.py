@@ -676,15 +676,11 @@ if MCP_AVAILABLE:
             return [TextContent(type="text", text=json.dumps(summary, indent=2))]
 
         elif name == "debug-env":
-            import os
             debug_info = {
                 "cwd": os.getcwd(),
                 "env": dict(os.environ),
-                "sys_path": sys.path if 'sys' in locals() else []
+                "sys_path": sys.path,
             }
-            if 'sys' not in locals():
-                import sys
-                debug_info["sys_path"] = sys.path
             return [TextContent(type="text", text=json.dumps(debug_info, indent=2))]
 
         elif name == "graph-query":
