@@ -996,6 +996,9 @@ class IndexerService:
                 except Exception as e:
                     logger.warning(f"Failed to delete graph entry for {path}: {e}")
 
+        # ── 6. Post Processing ────────────────────────────────────
+        self.post_processing()
+
         self._save_global_state(last_index_time=datetime.now().isoformat())
 
         resp = {
@@ -1011,6 +1014,16 @@ class IndexerService:
         if warning:
             resp["warning"] = warning
         return resp
+
+    def post_processing(self):
+        """Run post-processing steps like community detection and execution flow detection after indexing."""
+        if self.graph_store:
+            logger.info("Running post-processing for graph store...")
+            try:
+                self.graph_store.compute_communities()
+                self.graph_store.compute_execution_flows()
+            except Exception as e:
+                logger.error(f"Post-processing failed: {e}")
 
     def _pipeline_qdrant(
         self,
