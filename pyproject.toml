@@ -52,6 +52,8 @@ dependencies = [
     "aiohttp>=3.9.0",
     "xxhash>=3.4.0",
     "neo4j>=5.0.0",
+    "langgraph>=1.0.10",
+    "langchain-core>=1.2.16",
 ]
 
 [project.optional-dependencies]

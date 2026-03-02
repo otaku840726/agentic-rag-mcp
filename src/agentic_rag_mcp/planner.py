@@ -9,25 +9,44 @@ from dataclasses import dataclass, asdict
 from .provider import create_client_for
 from .models import (
     PlannerOutput, QueryIntent, MissingEvidence,
-    EvidenceCard, SearchState, AnalystOutput
+    EvidenceCard, GraphState, AnalystOutput
 )
 from .utils import extract_json_from_response, strip_think_tags
 
 
 PLANNER_SYSTEM_PROMPT = """你是代碼庫搜索 Planner。
-你的任務是根據當前搜索狀態和 Analyst 的全局分析，生成下一輪搜索查詢。
+你的任務是根據「黑板」(GraphState) 上的子任務 (sub_tasks)，決定要調用哪些工具。
+
+**可用工具:**
+1. semantic_search:
+   - 用法: `{"tool": "semantic_search", "args": {"query": "模糊概念"}}`
+   - 說明: 混合搜索，適合尋找模糊概念、邏輯。
+2. graph_symbol_search:
+   - 用法: `{"tool": "graph_symbol_search", "args": {"symbol": "類名/方法名", "depth": 1}}`
+   - 說明: 查找 AST 結構圖，精準尋找方法的調用者或實作。
+3. read_exact_file:
+   - 用法: `{"tool": "read_exact_file", "args": {"path": "檔案路徑", "lines": "10-50"}}`
+   - 說明: 閱讀特定檔案的完整內容或特定行數。
+4. list_directory:
+   - 用法: `{"tool": "list_directory", "args": {"path": "資料夾路徑"}}`
+   - 說明: 探索資料夾結構。
 
 **職責:**
-1. 理解 Analyst 的全局分析（核心主題、角色、已覆蓋/未覆蓋維度）
-2. 將 Analyst 識別的「未覆蓋維度」轉化為具體的搜索查詢
-3. 結合已有證據和搜索歷史，避免重複搜索
-4. 判斷是否已收集到足夠的證據（should_stop）
+1. 觀察「待辦清單 (sub_tasks)」。
+2. 決定這一步要調用哪個（或哪些）工具。
+3. 判斷是否所有任務都完成了且證據足夠 (should_stop)。如果足夠，可以將 `should_stop` 設為 true。
 
 **只輸出 JSON，不要任何解釋。**
 
 **輸出格式:**
 {
     "should_stop": false,
+    "tool_calls": [
+        {
+            "tool": "semantic_search",
+            "args": {"query": "密碼驗證邏輯"}
+        }
+    ],
     "missing_evidence": [
         {
             "need": "描述缺少什麼",
@@ -35,40 +54,8 @@ PLANNER_SYSTEM_PROMPT = """你是代碼庫搜索 Planner。
             "priority": "high|medium|low"
         }
     ],
-    "evidence_found": ["card_id1", "card_id2"],
-    "next_queries": [
-        {
-            "query": "查詢內容",
-            "purpose": "查詢目的",
-            "query_type": "keyword|symbol|config|semantic",
-            "operator": "semantic|keyword|exact|symbol_ref|callsite"
-        }
-    ],
-    "rationale": "簡短的決策理由（1-2句）"
+    "rationale": "簡短的決策理由"
 }
-
-**查詢類型說明:**
-- hybrid: 混合搜索 (dense + sparse BM25 RRF fusion)，推薦預設使用
-- semantic: 純語義搜索，適合模糊概念
-- keyword: BM25 關鍵字搜索，適合技術名詞、SP名、類名精確匹配
-- exact: 精確匹配，適合類名、方法名
-- symbol_ref: 符號引用搜索
-- callsite: 調用點搜索，如 "methodName("
-
-**Accept 條件常見類型:**
-- "config key": 配置鍵名
-- "default value": 預設值
-- "where read": 讀取位置
-- "enum definition": 枚舉定義
-- "transition": 狀態轉換
-- "entry point": 入口點
-- "call edge": 調用關係
-- "counterpart": 對稱對應物
-
-**重要：利用 Analyst 的分析結果**
-- 如果 Analyst 提供了「未覆蓋的維度」（gaps），你必須為每個 gap 生成至少一個搜索查詢
-- 如果 Analyst 識別了多個角色，確保每個角色與核心主題的互動都被搜索覆蓋
-- 如果 Analyst 的分析為空，則按一般策略生成查詢
 """
 
 
@@ -107,6 +94,8 @@ class Planner:
         iteration: int,
         previous_missing: Optional[List[MissingEvidence]] = None,
         analyst_output: Optional[AnalystOutput] = None,
+        sub_tasks: Optional[List[str]] = None,
+        tool_results: Optional[List[Dict[str, Any]]] = None,
         logger: Any = None,
         search_id: str = "",
         usage_log: Optional[list] = None
@@ -121,6 +110,8 @@ class Planner:
             iteration: 當前迭代次數
             previous_missing: 上一輪的 missing evidence
             analyst_output: Analyst 的全局分析結果
+            sub_tasks: Analyst 拆解的子任務
+            tool_results: 之前的工具執行結果
 
         Returns:
             PlannerOutput
@@ -128,7 +119,7 @@ class Planner:
         # 構建用戶提示
         user_prompt = self._build_user_prompt(
             query, evidence_summary, search_history, iteration,
-            previous_missing, analyst_output
+            previous_missing, analyst_output, sub_tasks, tool_results
         )
 
         # 調用 LLM
@@ -185,17 +176,25 @@ class Planner:
         search_history: List[str],
         iteration: int,
         previous_missing: Optional[List[MissingEvidence]],
-        analyst_output: Optional[AnalystOutput] = None
+        analyst_output: Optional[AnalystOutput] = None,
+        sub_tasks: Optional[List[str]] = None,
+        tool_results: Optional[List[Dict[str, Any]]] = None
     ) -> str:
         """構建用戶提示"""
         parts = [
             f"**原始問題:** {query}",
             f"**當前迭代:** {iteration}",
             "",
+            "**待辦清單 (sub_tasks):**",
+            "\n".join([f"- {task}" for task in sub_tasks]) if sub_tasks else "目前沒有待辦事項",
+            "",
             "**當前證據:**",
             evidence_summary if evidence_summary else "尚未收集到證據",
             "",
-            "**已搜索查詢:**",
+            "**工具執行結果 (這回合):**",
+            str(tool_results) if tool_results else "尚無工具結果",
+            "",
+            "**已執行工具與搜索查詢:**",
             ", ".join(search_history) if search_history else "尚未進行搜索",
         ]
 
@@ -238,7 +237,7 @@ class Planner:
                     priority=m.get("priority", "medium")
                 ))
 
-            # 解析 next_queries
+            # 解析 next_queries (向後兼容，如果原本生成 query 的話)
             next_queries = []
             for q in data.get("next_queries", []):
                 next_queries.append(QueryIntent(
@@ -249,8 +248,12 @@ class Planner:
                     filters=q.get("filters")
                 ))
 
+            # 解析 tool_calls
+            tool_calls = data.get("tool_calls", [])
+
             return PlannerOutput(
                 next_queries=next_queries,
+                tool_calls=tool_calls,
                 missing_evidence=missing_evidence,
                 evidence_found=data.get("evidence_found", []),
                 rationale=data.get("rationale", ""),
@@ -262,6 +265,7 @@ class Planner:
             # 解析失敗時返回默認輸出
             return PlannerOutput(
                 next_queries=[],
+                tool_calls=[],
                 missing_evidence=[],
                 evidence_found=[],
                 rationale=f"Failed to parse LLM response: {e}",

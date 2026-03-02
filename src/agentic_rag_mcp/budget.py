@@ -2,10 +2,10 @@
 Budget & Quality Gate - 預算控制和質量門檻
 """
 
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Any
 from dataclasses import dataclass
 
-from .models import EvidenceCard, MissingEvidence, SearchState, Budget, QualityGate
+from .models import EvidenceCard, MissingEvidence, Budget, QualityGate
 from .utils import check_accept_coverage
 
 
@@ -16,12 +16,12 @@ class BudgetManager:
         self.budget = budget or Budget()
         self.tokens_used = 0
 
-    def can_continue(self, state: SearchState) -> Tuple[bool, str]:
+    def can_continue(self, state: Any) -> Tuple[bool, str]:
         """檢查是否可以繼續"""
-        if state.iteration >= self.budget.max_iterations:
+        if getattr(state, "iteration", 0) >= self.budget.max_iterations:
             return False, "max_iterations_reached"
 
-        if state.total_tokens >= self.budget.total_token_budget:
+        if getattr(state, "total_tokens", 0) >= self.budget.total_token_budget:
             return False, "token_budget_exceeded"
 
         return True, ""
@@ -101,7 +101,7 @@ class StopConditionChecker:
 
     def should_stop(
         self,
-        state: SearchState,
+        state: Any,
         evidence_cards: List[EvidenceCard]
     ) -> Tuple[bool, str, List]:
         """
@@ -114,8 +114,9 @@ class StopConditionChecker:
             return True, reason, []
 
         # 2. 所有 missing_evidence 都滿足 + 質量通過
+        missing_evidence = getattr(state, "missing_evidence", [])
         all_satisfied = self._check_missing_evidence_satisfied(
-            state.missing_evidence, evidence_cards
+            missing_evidence, evidence_cards
         )
         if all_satisfied:
             quality_passed, quality_reason = self.quality_checker.check(evidence_cards)
@@ -123,11 +124,14 @@ class StopConditionChecker:
                 return True, "all_evidence_found_and_quality_passed", []
 
         # 3. Stuck 處理
-        if state.consecutive_no_new == 1 and not state.fallback_triggered:
+        consecutive_no_new = getattr(state, "consecutive_no_new", 0)
+        fallback_triggered = getattr(state, "fallback_triggered", False)
+
+        if consecutive_no_new == 1 and not fallback_triggered:
             # 第一次 stuck → 觸發 fallback，不停止
             return False, "triggering_fallback", []
 
-        if state.consecutive_no_new >= 2:
+        if consecutive_no_new >= 2:
             # 連續 2 次 stuck → 停止
             return True, "stuck_after_fallback", []
 
