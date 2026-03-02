@@ -556,9 +556,11 @@ class GraphStore:
            OR start.fqn ENDS WITH ('.' + $name))
           AND ($project IS NULL OR start.project = $project)
         WITH start LIMIT 1
+        OPTIONAL MATCH (start)-[:IN_COMMUNITY]->(c:Community)
+        WITH start, c.name AS community_name
         MATCH path = (start){pattern}(neighbor:Symbol)
         WHERE neighbor.kind <> 'external'
-        WITH start, neighbor,
+        WITH start, community_name, neighbor,
              [rel IN relationships(path) | {{
                 type: type(rel),
                 source: startNode(rel).fqn,
@@ -570,15 +572,19 @@ class GraphStore:
             neighbor.kind AS kind,
             neighbor.file_path AS file_path,
             neighbor.namespace AS namespace,
-            edge_list
+            edge_list,
+            community_name
         LIMIT 50
         """
 
         nodes = []
         edges = set()
+        community_name = None
         with self.driver.session(database=self.database) as session:
             result = session.run(query, name=symbol_name, project=proj)
             for record in result:
+                if community_name is None:
+                    community_name = record["community_name"]
                 nodes.append({
                     "fqn": record["fqn"],
                     "name": record["name"],
@@ -595,6 +601,7 @@ class GraphStore:
                 {"type": t, "source": s, "target": tgt}
                 for t, s, tgt in edges
             ],
+            "community": community_name
         }
 
     def get_call_chain(

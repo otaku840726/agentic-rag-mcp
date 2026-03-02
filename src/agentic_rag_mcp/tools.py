@@ -33,6 +33,23 @@ def graph_symbol_search_tool(symbol: str, graph_store, depth: int = 1) -> Dict[s
     except Exception as e:
         return {"error": str(e)}
 
+def community_search_tool(query: str, graph_store) -> Dict[str, Any]:
+    if not graph_store:
+        return {"error": "Graph store not available or Neo4j disabled"}
+    try:
+        cypher = """
+        MATCH (c:Community)
+        WHERE toLower(c.name) CONTAINS toLower($query)
+        OPTIONAL MATCH (s:Symbol)-[:IN_COMMUNITY]->(c)
+        WITH c, collect(s.name)[..10] AS top_symbols
+        RETURN c.name AS module_name, top_symbols
+        LIMIT 5
+        """
+        results = graph_store.cypher_query(cypher, {"query": query})
+        return {"communities": results}
+    except Exception as e:
+        return {"error": str(e)}
+
 def process_search_tool(query: str, graph_store) -> Dict[str, Any]:
     if not graph_store:
         return {"error": "Graph store not available or Neo4j disabled"}
@@ -40,7 +57,7 @@ def process_search_tool(query: str, graph_store) -> Dict[str, Any]:
         # Simple match using APOC or direct Cypher to find matching Process nodes
         cypher = """
         MATCH (p:Process)
-        WHERE p.name CONTAINS $query OR p.entry_point CONTAINS $query
+        WHERE toLower(p.name) CONTAINS toLower($query) OR toLower(p.entry_point) CONTAINS toLower($query)
         RETURN p.name AS name, p.entry_point AS entry_point, p.file_path AS file_path, p.steps AS steps
         LIMIT 5
         """

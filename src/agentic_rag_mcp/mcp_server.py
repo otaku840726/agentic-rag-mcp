@@ -404,6 +404,23 @@ if MCP_AVAILABLE:
                     }
                 ),
                 Tool(
+                    name="graph-community-search",
+                    description="""
+                    Search for logical modules (Community nodes) in the graph.
+                    This is useful when you want to understand the macro architecture or find which core classes belong to a specific business module (e.g. 'Auth', 'Order').
+                    """,
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Keyword for the module name"
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                ),
+                Tool(
                     name="graph-neighbors",
                     description="""
                     Get related symbols for a given symbol name from the code knowledge graph.
@@ -640,6 +657,39 @@ if MCP_AVAILABLE:
                 return [TextContent(type="text", text="\n".join(parts))]
             except Exception as e:
                 return [TextContent(type="text", text=f"Graph neighbors error: {e}")]
+
+        elif name == "graph-community-search":
+            gs = get_graph_store()
+            if gs is None:
+                return [TextContent(type="text", text="Error: Neo4j is not enabled or not reachable")]
+            query = arguments.get("query", "")
+            if not query:
+                return [TextContent(type="text", text="Error: query is required")]
+            from .tools import community_search_tool
+            try:
+                result = community_search_tool(query, gs)
+
+                if "error" in result:
+                    return [TextContent(type="text", text=f"Error searching communities: {result['error']}")]
+
+                parts = [f"## Modules (Communities) for: '{query}'\n"]
+                communities = result.get("communities", [])
+
+                if not communities:
+                    parts.append("No matching modules found.")
+                else:
+                    for i, c in enumerate(communities, 1):
+                        parts.append(f"### {i}. {c.get('module_name', 'Unknown')}")
+                        top_symbols = c.get('top_symbols', [])
+                        if top_symbols:
+                            parts.append("**Core Symbols:**")
+                            for sym in top_symbols:
+                                parts.append(f"- `{sym}`")
+                        parts.append("\n---\n")
+
+                return [TextContent(type="text", text="\n".join(parts))]
+            except Exception as e:
+                return [TextContent(type="text", text=f"Graph community search error: {e}")]
 
         elif name == "graph-process-search":
             gs = get_graph_store()

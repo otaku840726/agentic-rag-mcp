@@ -16,7 +16,7 @@ from .models import (
 from langgraph.graph import StateGraph, END
 
 from .tools import (
-    semantic_search_tool, graph_symbol_search_tool, process_search_tool,
+    semantic_search_tool, graph_symbol_search_tool, process_search_tool, community_search_tool,
     read_exact_file_tool, list_directory_tool
 )
 from .utils import (
@@ -293,6 +293,12 @@ class AgenticSearch:
                     new_search_history.append(f"process:{q}")
                     res = process_search_tool(q, self.graph_enhancer.graph_store if self.graph_enhancer else None)
                     new_results.append({"tool": "process", "res": str(res)})
+            elif tool_name == "community_search":
+                q = args.get("query", "")
+                if q:
+                    new_search_history.append(f"community:{q}")
+                    res = community_search_tool(q, self.graph_enhancer.graph_store if self.graph_enhancer else None)
+                    new_results.append({"tool": "community", "res": str(res)})
             elif tool_name == "read_exact_file":
                 path = args.get("path", "")
                 if path:
@@ -333,7 +339,7 @@ class AgenticSearch:
                 )
                 self.evidence_store.add([card])
                 new_count += 1
-            elif res["tool"] in ["graph", "process"]:
+            elif res["tool"] in ["graph", "process", "community"]:
                 content = res.get("res", "")
                 if not content: continue
                 snippet = create_snippet(content, 200)
