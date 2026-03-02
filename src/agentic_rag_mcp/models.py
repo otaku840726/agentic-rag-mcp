@@ -74,10 +74,12 @@ class MissingEvidence:
 @dataclass
 class AnalystOutput:
     """Analyst 的結構化輸出"""
+    intent: str                                # 意圖 (e.g., "Bug 修復", "知識問答")
     subject: str                               # 核心主題
     actors: List[Dict[str, str]]               # [{"name": "...", "role": "..."}]
     covered: List[str]                         # 已覆蓋的維度
     gaps: List[str]                            # 未覆蓋的維度
+    sub_tasks: List[str] = field(default_factory=list) # 拆解的子任務清單
     reasoning: str = ""                        # 推理過程
 
 
@@ -91,6 +93,7 @@ class PlannerOutput:
     rationale: str                             # 決策理由 (簡短)
     should_stop: bool = False                  # Planner 認為是否應該停止
     symmetry_analysis: str = ""                # 對稱性思考結果（保留向後兼容）
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list) # [{tool: 'name', args: {...}}]
 
 
 # ========== Evidence Reference ==========
@@ -149,16 +152,26 @@ class SynthesizedResponse:
 
 
 # ========== Search State ==========
-@dataclass
-class SearchState:
-    """搜索狀態"""
+from typing import TypedDict, Annotated
+import operator
+
+class GraphState(TypedDict):
+    """狀態圖的共享狀態 (Blackboard)"""
     query: str                                 # 原始查詢
-    iteration: int = 0                         # 當前迭代次數
-    total_tokens: int = 0                      # 已消耗 token
-    consecutive_no_new: int = 0                # 連續無新發現次數
-    search_history: List[str] = field(default_factory=list)
-    missing_evidence: List[MissingEvidence] = field(default_factory=list)
-    fallback_triggered: bool = False           # 是否已觸發 fallback
+    tech_stack: str                            # 技術棧 (e.g., "Java/Spring", "Node.js")
+    intent: str                                # 意圖 (e.g., "Bug 修復", "知識問答")
+    sub_tasks: Annotated[List[str], operator.add]             # 待辦清單 (To-Do)
+    completed_tasks: Annotated[List[str], operator.add]       # 已完成清單
+    evidence_summary: str                      # 當前證據摘要
+    iteration: int                             # 當前迭代次數
+    search_history: Annotated[List[str], operator.add]        # 已搜索的查詢歷史
+    planner_tool_calls: List[Dict[str, Any]]                   # Planner 決定的工具調用列表 (不 append，每次直接覆蓋)
+    tool_results: List[Dict[str, Any]]                         # 工具執行結果 (不 append，每次直接覆蓋)
+    should_stop: bool                          # 是否滿足停機條件
+    final_response: Optional[SynthesizedResponse] # 最終生成的回答
+    consecutive_no_new: int                    # 連續無新發現次數
+    fallback_triggered: bool                   # 是否已觸發 fallback
+    missing_evidence: List[MissingEvidence]    # (向下兼容) 缺失的證據
 
 
 # ========== Quality Gate ==========

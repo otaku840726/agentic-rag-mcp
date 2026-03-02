@@ -9,9 +9,15 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field, asdict
 
 from .models import (
-    SearchResult, SynthesizedResponse, SearchState,
+    SearchResult, SynthesizedResponse, GraphState,
     EvidenceCard, QueryIntent, MissingEvidence,
     Budget, QualityGate
+)
+from langgraph.graph import StateGraph, END
+
+from .tools import (
+    semantic_search_tool, graph_symbol_search_tool,
+    read_exact_file_tool, list_directory_tool
 )
 from .utils import (
     compute_fingerprint, extract_named_entities,
@@ -90,7 +96,7 @@ class AgenticSearch:
         self._graph_enhancer_checked = False
 
         # 停機條件
-        budget = Budget(
+        self.budget = Budget(
             max_iterations=self.config.max_iterations,
             total_token_budget=self.config.total_token_budget
         )
@@ -100,7 +106,9 @@ class AgenticSearch:
             require_call_edge=self.config.require_call_edge,
             require_named_entity=self.config.require_named_entity
         )
-        self.stop_checker = StopConditionChecker(budget, quality_gate)
+        self.stop_checker = StopConditionChecker(self.budget, quality_gate)
+
+        self.graph = self._build_graph()
 
     @property
     def graph_enhancer(self):
@@ -172,6 +180,237 @@ class AgenticSearch:
             use_cross_encoder=True,
         )
 
+    def _build_graph(self):
+        builder = StateGraph(GraphState)
+
+        # 定義節點
+        builder.add_node("context_awareness", self._node_context_awareness)
+        builder.add_node("analyst", self._node_analyst)
+        builder.add_node("planner", self._node_planner)
+        builder.add_node("tool_executor", self._node_tool_executor)
+        builder.add_node("synthesizer", self._node_synthesizer)
+
+        # 定義邊
+        builder.set_entry_point("context_awareness")
+        builder.add_edge("context_awareness", "analyst")
+        builder.add_edge("analyst", "planner")
+        builder.add_edge("planner", "tool_executor")
+        builder.add_conditional_edges("tool_executor", self._route_after_tools, {
+            "planner": "planner",
+            "synthesizer": "synthesizer"
+        })
+        builder.add_edge("synthesizer", END)
+
+        return builder.compile()
+
+    def _node_context_awareness(self, state: GraphState) -> Dict[str, Any]:
+        tech_stack = "Unknown"
+        if os.path.exists("pom.xml"):
+            tech_stack = "Java/Spring"
+        elif os.path.exists("package.json"):
+            tech_stack = "Node.js"
+        elif os.path.exists("pyproject.toml") or os.path.exists("requirements.txt"):
+            tech_stack = "Python"
+        elif os.path.exists("go.mod"):
+            tech_stack = "Go"
+
+        return {
+            "tech_stack": tech_stack,
+            "iteration": 0,
+            "search_history": [],
+            "completed_tasks": [],
+            "tool_results": [],
+            "consecutive_no_new": 0,
+            "fallback_triggered": False,
+            "should_stop": False,
+            "sub_tasks": []
+        }
+
+    def _node_analyst(self, state: GraphState) -> Dict[str, Any]:
+        evidence_summary = self.evidence_store.get_summary_for_planner()
+        out = self.analyst.analyze(
+            query=state["query"],
+            evidence_summary=evidence_summary,
+            iteration=state["iteration"]
+        )
+        return {
+            "intent": out.intent,
+            "sub_tasks": out.sub_tasks,
+            "evidence_summary": evidence_summary
+        }
+
+    def _node_planner(self, state: GraphState) -> Dict[str, Any]:
+        iteration = state["iteration"] + 1
+        self.evidence_store.set_round(iteration)
+
+        out = self.planner.plan(
+            query=state["query"],
+            evidence_summary=state.get("evidence_summary", ""),
+            search_history=state.get("search_history", []),
+            iteration=iteration,
+            previous_missing=state.get("missing_evidence", []),
+            sub_tasks=state.get("sub_tasks", []),
+            tool_results=state.get("tool_results", [])
+        )
+
+        # We replace the list entirely (or we can use reducer, but for tools we want exact replacement)
+        # For reducer to replace instead of append, we can structure it differently,
+        # but since we clear it in tool_executor anyway, appending is fine or we just return it.
+        return {
+            "iteration": iteration,
+            "planner_tool_calls": out.tool_calls,
+            "missing_evidence": out.missing_evidence,
+            "should_stop": out.should_stop
+        }
+
+    def _node_tool_executor(self, state: GraphState) -> Dict[str, Any]:
+        tool_calls = state.get("planner_tool_calls", [])
+
+        all_raw_results = []
+        new_results = []
+        new_search_history = []
+
+        # Execute tool calls
+        for tc in tool_calls:
+            tool_name = tc.get("tool")
+            args = tc.get("args", {})
+
+            if tool_name == "semantic_search":
+                q = args.get("query", "")
+                if q:
+                    new_search_history.append(f"semantic_search:{q}")
+                    res = semantic_search_tool(q, self.hybrid_search, self.query_builder, self.reranker, top_k=self.config.top_n_search)
+                    all_raw_results.extend(res)
+            elif tool_name == "graph_symbol_search":
+                symbol = args.get("symbol", "")
+                if symbol:
+                    new_search_history.append(f"graph:{symbol}")
+                    res = graph_symbol_search_tool(symbol, self.graph_enhancer.graph_store if self.graph_enhancer else None, args.get("depth", 1))
+                    new_results.append({"tool": "graph", "res": str(res)})
+            elif tool_name == "read_exact_file":
+                path = args.get("path", "")
+                if path:
+                    new_search_history.append(f"read_file:{path}")
+                    res = read_exact_file_tool(path, args.get("lines"))
+                    new_results.append({"tool": "read_file", "path": path, "content": res})
+            elif tool_name == "list_directory":
+                path = args.get("path", "")
+                if path:
+                    new_search_history.append(f"list_dir:{path}")
+                    res = list_directory_tool(path)
+                    new_results.append({"tool": "list_dir", "path": path, "content": str(res)})
+
+        new_count = 0
+
+        # Helper to convert non-semantic tool results to evidence cards
+        import hashlib
+        for res in new_results:
+            if res["tool"] in ["read_file", "list_dir"]:
+                content = res.get("content", "")
+                if not content: continue
+                path = res.get("path", "unknown")
+                snippet = create_snippet(content, 200)
+                fingerprint = hashlib.md5((path + content).encode()).hexdigest()
+                card = EvidenceCard(
+                    id=f"{res['tool']}_{fingerprint[:8]}",
+                    path=path,
+                    symbol=None,
+                    snippet=snippet,
+                    chunk_text=content,
+                    score_hybrid=1.0,
+                    score_rerank=1.0,
+                    tags=[res["tool"]],
+                    round_found=state["iteration"],
+                    source_kind=detect_source_kind(path),
+                    span="full",
+                    fingerprint=fingerprint
+                )
+                self.evidence_store.add([card])
+                new_count += 1
+            elif res["tool"] == "graph":
+                content = res.get("res", "")
+                if not content: continue
+                snippet = create_snippet(content, 200)
+                fingerprint = hashlib.md5(content.encode()).hexdigest()
+                card = EvidenceCard(
+                    id=f"graph_{fingerprint[:8]}",
+                    path="graph_search",
+                    symbol=None,
+                    snippet=snippet,
+                    chunk_text=content,
+                    score_hybrid=1.0,
+                    score_rerank=1.0,
+                    tags=["graph_symbol"],
+                    round_found=state["iteration"],
+                    source_kind="code",
+                    span="graph",
+                    fingerprint=fingerprint
+                )
+                self.evidence_store.add([card])
+                new_count += 1
+
+        if all_raw_results:
+            new_cards = self._convert_to_evidence_cards(all_raw_results, state["iteration"])
+            new_count += self.evidence_store.add(new_cards)
+
+            if self.graph_enhancer and new_cards:
+                try:
+                    graph_results = self.graph_enhancer.expand_evidence(new_cards, top_k=5)
+                    if graph_results:
+                        graph_cards = self._convert_to_evidence_cards(graph_results, state["iteration"])
+                        new_count += self.evidence_store.add(graph_cards)
+                except Exception:
+                    pass
+
+        consec_no_new = state.get("consecutive_no_new", 0)
+        if new_count == 0 and not tool_calls:
+            consec_no_new += 1
+        else:
+            consec_no_new = 0
+
+        return {
+            "search_history": new_search_history,
+            "tool_results": new_results,
+            "planner_tool_calls": [], # Clear tool_calls so we don't carry them over forever
+            "consecutive_no_new": consec_no_new,
+            "evidence_summary": self.evidence_store.get_summary_for_planner()
+        }
+
+    def _route_after_tools(self, state: GraphState) -> str:
+        if state.get("should_stop", False):
+            return "synthesizer"
+
+        all_cards = self.evidence_store.get_all_cards()
+
+        # Create a mock SearchState for StopConditionChecker backward compatibility
+        class MockState:
+            def __init__(self, s):
+                self.iteration = s.get("iteration", 0)
+                self.consecutive_no_new = s.get("consecutive_no_new", 0)
+                self.fallback_triggered = s.get("fallback_triggered", False)
+                self.missing_evidence = s.get("missing_evidence", [])
+
+        should_stop, _, _ = self.stop_checker.should_stop(MockState(state), all_cards)
+
+        if should_stop or state["iteration"] >= self.budget.max_iterations:
+            return "synthesizer"
+
+        return "planner"
+
+    def _node_synthesizer(self, state: GraphState) -> Dict[str, Any]:
+        all_evidence = self.evidence_store.get_all_cards()
+        all_evidence.sort(key=lambda x: x.score_rerank, reverse=True)
+        top_evidence = all_evidence[:30]
+
+        response = self.synthesizer.synthesize(
+            query=state["query"],
+            evidence_cards=top_evidence,
+            search_history=state.get("search_history", []),
+            iterations=state["iteration"],
+            logger=self.logger
+        )
+        return {"final_response": response}
+
     def search(self, query: str) -> SearchResult:
         """
         執行自主搜索
@@ -184,7 +423,6 @@ class AgenticSearch:
         """
         # 初始化狀態
         search_id = str(uuid.uuid4())
-        state = SearchState(query=query)
         self.evidence_store.clear()
 
         # Log Start
@@ -201,175 +439,57 @@ class AgenticSearch:
         search_start_time = time.time()
 
         try:
-            # 主循環
-            while True:
-                state.iteration += 1
-                self.evidence_store.set_round(state.iteration)
+            # 初始狀態
+            initial_state = {
+                "query": query,
+                "tech_stack": "Unknown",
+                "intent": "",
+                "sub_tasks": [],
+                "completed_tasks": [],
+                "evidence_summary": "",
+                "iteration": 0,
+                "search_history": [],
+                "planner_tool_calls": [],
+                "tool_results": [],
+                "should_stop": False,
+                "final_response": None,
+                "consecutive_no_new": 0,
+                "fallback_triggered": False,
+                "missing_evidence": []
+            }
 
-                iteration_info = {
-                    "iteration": state.iteration,
-                    "queries": [],
-                    "results_found": 0,
-                    "new_evidence": 0
-                }
+            # 執行狀態圖
+            final_state = self.graph.invoke(initial_state)
 
-                # 1a. Analyst 全局分析
-                evidence_summary = self.evidence_store.get_summary_for_planner()
-                analyst_output = self.analyst.analyze(
-                    query=query,
-                    evidence_summary=evidence_summary,
-                    iteration=state.iteration,
-                    logger=self.logger,
-                    search_id=search_id,
-                    usage_log=usage_log
-                )
-
-                iteration_info["analyst"] = {
-                    "subject": analyst_output.subject,
-                    "actors": analyst_output.actors,
-                    "covered": analyst_output.covered,
-                    "gaps": analyst_output.gaps,
-                }
-
-                # 1b. Planner 根據 Analyst 分析生成查詢計劃
-                plan = self.planner.plan(
-                    query=query,
-                    evidence_summary=evidence_summary,
-                    search_history=state.search_history,
-                    iteration=state.iteration,
-                    previous_missing=state.missing_evidence,
-                    analyst_output=analyst_output,
-                    logger=self.logger,
-                    search_id=search_id,
-                    usage_log=usage_log
-                )
-
-                # 更新狀態
-                state.missing_evidence = plan.missing_evidence
-                iteration_info["missing_evidence"] = [m.need for m in plan.missing_evidence]
-
-                # Planner 判斷應該停止
-                if plan.should_stop:
-                    iteration_info["stop_reason"] = "planner_decided"
-                    debug_info["iterations"].append(iteration_info)
-                    
-                    # Log Iteration (Stop)
-                    self.logger.log_iteration(search_id, state.iteration, asdict(plan), iteration_info)
-                    break
-
-                # 2. 執行搜索
-                queries_to_execute = plan.next_queries
-
-                # 如果是 fallback 觸發
-                if state.consecutive_no_new == 1 and not state.fallback_triggered:
-                    fallback_queries = self.query_builder.build_fallback_queries(
-                        self.evidence_store.get_working_set(),
-                        state.missing_evidence
-                    )
-                    queries_to_execute.extend(fallback_queries)
-                    state.fallback_triggered = True
-                    iteration_info["fallback_triggered"] = True
-
-                # 構建實際查詢
-                all_queries = []
-                for intent in queries_to_execute:
-                    built = self.query_builder.build_from_intent(intent)
-                    all_queries.extend(built)
-                    state.search_history.append(intent.query)
-                    iteration_info["queries"].append(intent.query)
-
-                # 批量搜索
-                raw_results = self.batch_search.search_batch(
-                    all_queries,
-                    top_n_per_query=self.config.top_n_search // len(all_queries) if all_queries else 50
-                )
-                iteration_info["results_found"] = len(raw_results)
-
-                # 3. Rerank
-                reranked = self.reranker.rerank(
-                    query=query,
-                    candidates=raw_results,
-                    top_m=self.config.top_m_rerank
-                )
-
-                # 4. 轉換為 EvidenceCard 並存入
-                new_cards = self._convert_to_evidence_cards(reranked, state.iteration)
-                new_count = self.evidence_store.add(new_cards)
-
-                # 4b. Optional: Graph-based context expansion
-                if self.graph_enhancer and new_cards:
-                    try:
-                        graph_results = self.graph_enhancer.expand_evidence(new_cards, top_k=5)
-                        if graph_results:
-                            graph_cards = self._convert_to_evidence_cards(graph_results, state.iteration)
-                            graph_new = self.evidence_store.add(graph_cards)
-                            new_count += graph_new
-                            iteration_info["graph_expansion"] = len(graph_results)
-                    except Exception:
-                        pass  # Graph expansion is best-effort
-
-                iteration_info["new_evidence"] = new_count
-
-                # 更新 consecutive_no_new
-                if new_count == 0:
-                    state.consecutive_no_new += 1
-                else:
-                    state.consecutive_no_new = 0
-                    state.fallback_triggered = False  # 重置 fallback 狀態
-
-                # 5. 檢查停機條件
-                all_cards = self.evidence_store.get_all_cards()
-                should_stop, stop_reason, _ = self.stop_checker.should_stop(state, all_cards)
-
-                iteration_info["stop_reason"] = stop_reason if should_stop else None
-                debug_info["iterations"].append(iteration_info)
-                
-                # Log Iteration
-                self.logger.log_iteration(search_id, state.iteration, asdict(plan), iteration_info)
-
-                if should_stop:
-                    break
-
-            # 6. Synthesize 最終回應
-            all_evidence = self.evidence_store.get_all_cards()
-            # 按分數排序取 top
-            all_evidence.sort(key=lambda x: x.score_rerank, reverse=True)
-            top_evidence = all_evidence[:30]
-
-            response = self.synthesizer.synthesize(
-                query=query,
-                evidence_cards=top_evidence,
-                search_history=state.search_history,
-                iterations=state.iteration,
-                logger=self.logger,
-                search_id=search_id,
-                usage_log=usage_log
-            )
-
-            debug_info["search_history"] = state.search_history
-            debug_info["final_evidence_count"] = len(all_evidence)
+            response = final_state.get("final_response")
 
             # Aggregate performance stats
             elapsed_ms = round((time.time() - search_start_time) * 1000)
-            total_prompt = sum(e.get("prompt_tokens", 0) for e in usage_log)
-            total_completion = sum(e.get("completion_tokens", 0) for e in usage_log)
+
+            # Collect metrics (mocked as Graph replaces usage_log)
             debug_info["perf_stats"] = {
                 "elapsed_ms": elapsed_ms,
-                "total_prompt_tokens": total_prompt,
-                "total_completion_tokens": total_completion,
-                "total_tokens": total_prompt + total_completion,
-                "llm_calls": len(usage_log),
-                "breakdown": usage_log,
+                "total_prompt_tokens": 0,
+                "total_completion_tokens": 0,
+                "total_tokens": 0,
+                "llm_calls": 0,
+                "breakdown": [],
             }
 
-            # Log End
-            self.logger.log_end(search_id, True, asdict(response))
+            if response:
+                self.logger.log_end(search_id, True, asdict(response))
 
-            return SearchResult(
-                success=True,
-                response=response,
-                debug_info=debug_info
-            )
+                return SearchResult(
+                    success=True,
+                    response=response,
+                    debug_info=debug_info
+                )
+            else:
+                return SearchResult(
+                    success=False,
+                    error="Synthesizer did not generate a response",
+                    debug_info=debug_info
+                )
 
         except Exception as e:
             import traceback

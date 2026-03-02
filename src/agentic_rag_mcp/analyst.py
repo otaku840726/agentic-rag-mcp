@@ -15,43 +15,36 @@ from .models import AnalystOutput
 from .utils import extract_json_from_response
 
 
-ANALYST_SYSTEM_PROMPT = """你是一個抽象分析者。
-你的任務是對一組證據做「退後一步」的分析，不關心代碼細節，只關心結構性的全局視角。
+ANALYST_SYSTEM_PROMPT = """你是一個抽象分析者 (Analyst)。
+你的任務是讀取黑板上的資訊，判斷使用者的「真實意圖」，並將大問題拆解為具體的子任務清單。
 
-**你要回答三個問題：**
+**你要回答的問題：**
 
-1. **主題是什麼？**
+1. **意圖分類：** 是「知識問答」、「找尋 Bug」、「代碼重構」，還是「新增功能」？
+2. **主題是什麼？**
    這些證據描述的動作，最終作用在什麼東西上？
    剝離所有傳遞方式、機制、流程名稱，只留下那個被作用的東西本身。
-   它應該是一個任何人不需要看代碼也能理解的概念。
-
-   **自檢：你寫出來的主題中，是否還包含「怎麼傳遞」或「怎麼操作」的部分？**
-   如果是，繼續往下剝，直到只剩下「被傳遞的東西」或「被操作的對象」本身。
-   例如：「存款通知」→ 「通知」是傳遞方式 → 剝掉 → 「存款信息」。
-   例如：「訂單狀態變更事件」→ 「事件」是傳遞方式 → 剝掉 → 「訂單狀態」。
-
-2. **涉及哪些角色？**
+3. **涉及哪些角色？**
    誰生產它？誰消費它？誰中轉它？
-   「角色」可以是人、系統、服務、模組 —— 任何獨立的參與者。
-   **特別注意**：不要只列出證據中出現的角色。思考誰是這個主題的最終消費者（end consumer），
-   即使證據中沒有直接提到他。
-
-3. **已覆蓋了哪些維度？還缺哪些？**
+4. **已覆蓋了哪些維度？還缺哪些？**
    站到每一個角色的立場，問：他跟這個主題的所有互動方式，證據中覆蓋了幾種？
-   如果某個角色有多種互動途徑，但證據只展示了其中一種，那就是缺失的維度。
-
-   **特別注意最終消費者**：他獲取這個主題的所有途徑是什麼？
-   證據可能只展示了其中一條途徑，其他途徑就是缺失的維度。
+5. **初步拆解 (子任務 / To-Do)：**
+   將大問題拆解為具體的子任務清單。例如：
+   1. 找到 UserLogin 類別
+   2. 追蹤密碼驗證邏輯
+   3. 檢查何處可能傳入 Null
 
 **只輸出 JSON，不要任何解釋。**
 
 {
-    "subject": "核心主題（一個概念，不是類名，不包含傳遞方式）",
+    "intent": "意圖分類 (知識問答|找尋 Bug|代碼重構|新增功能)",
+    "subject": "核心主題",
     "actors": [
-        {"name": "角色名稱", "role": "這個角色與主題的關係（生產者/消費者/中轉者等）"}
+        {"name": "角色名稱", "role": "這個角色與主題的關係"}
     ],
     "covered": ["已覆蓋的維度描述"],
     "gaps": ["未覆蓋的維度描述"],
+    "sub_tasks": ["子任務1", "子任務2", "子任務3"],
     "reasoning": "1-2句推理過程"
 }
 """
@@ -164,10 +157,12 @@ class Analyst:
 
         # 所有重試都失敗
         return AnalystOutput(
+            intent="知識問答",
             subject="",
             actors=[],
             covered=[],
             gaps=[],
+            sub_tasks=[],
             reasoning=last_error or "All retries failed"
         )
 
@@ -184,19 +179,23 @@ class Analyst:
                     actors.append({"name": a, "role": ""})
 
             return AnalystOutput(
+                intent=data.get("intent", "知識問答"),
                 subject=data.get("subject", ""),
                 actors=actors,
                 covered=data.get("covered", []),
                 gaps=data.get("gaps", []),
+                sub_tasks=data.get("sub_tasks", []),
                 reasoning=data.get("reasoning", "")
             )
 
         except (json.JSONDecodeError, Exception) as e:
             return AnalystOutput(
+                intent="知識問答",
                 subject="",
                 actors=[],
                 covered=[],
                 gaps=[],
+                sub_tasks=[],
                 reasoning=f"Failed to parse analyst response: {e}"
             )
 
@@ -475,11 +474,24 @@ class EnsembleAnalyst:
                 reasoning_parts.append(f"[{name}] {out.reasoning}")
         reasoning = " | ".join(reasoning_parts) if reasoning_parts else ""
 
+        # For intent and sub_tasks, just pick the first one that exists
+        intent = "知識問答"
+        sub_tasks = []
+        for _, out in outputs:
+            if out.intent and out.intent != "知識問答":
+                intent = out.intent
+            if out.sub_tasks:
+                sub_tasks.extend(out.sub_tasks)
+
+        sub_tasks = list(dict.fromkeys(sub_tasks))
+
         return AnalystOutput(
+            intent=intent,
             subject=subject,
             actors=actors,
             covered=covered,
             gaps=gaps,
+            sub_tasks=sub_tasks,
             reasoning=reasoning
         )
 
