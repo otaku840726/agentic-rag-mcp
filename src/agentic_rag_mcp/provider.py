@@ -89,13 +89,21 @@ def get_component_config(component: str) -> ComponentConfig:
     """取得某個 component 的配置
 
     Args:
-        component: "embedding" | "analyst" | "planner" | "synthesizer" | "judge"
+        component: "embedding" | "analyst" | "planner" | "synthesizer" | "judge" | "reranker"
     """
     cfg = load_config()
     comp = cfg.get(component, {})
+
+    default_provider = "openai"
+    default_model = "gpt-4o-mini"
+
+    if component == "reranker":
+        default_provider = "local"
+        default_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
     return ComponentConfig(
-        provider=comp.get("provider", "openai"),
-        model=comp.get("model", "gpt-4o-mini"),
+        provider=comp.get("provider", default_provider),
+        model=comp.get("model", default_model),
         identifier=comp.get("identifier"),
         max_tokens=int(comp.get("max_tokens", 4000)),
         temperature=float(comp.get("temperature", 0.1)),

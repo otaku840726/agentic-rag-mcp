@@ -5,8 +5,11 @@ Reranker - Cross-encoder 重排序
 """
 
 import os
+import requests
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
+
+from .provider import get_component_config, create_client
 
 # 延遲導入以避免不必要的加載
 _cross_encoder = None
@@ -24,22 +27,28 @@ def get_cross_encoder(model_name: str):
 @dataclass
 class RerankerConfig:
     """Reranker 配置"""
+    provider: str = "local"
     model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     top_m: int = 20  # 保留的結果數量
     batch_size: int = 32
 
 
 class Reranker:
-    """Cross-encoder 重排序器"""
+    """Cross-encoder 重排序器 (支援 Local 模型與遠端 API)"""
 
     def __init__(self, config: Optional[RerankerConfig] = None):
         self.config = config or RerankerConfig()
         self._model = None
+        self._api_client = None
+
+        # Determine if we use local model or remote API
+        if self.config.provider != "local":
+            self._api_client = create_client(self.config.provider)
 
     @property
     def model(self):
-        """延遲加載模型"""
-        if self._model is None:
+        """延遲加載模型 (僅 local)"""
+        if self._model is None and self.config.provider == "local":
             self._model = get_cross_encoder(self.config.model_name)
         return self._model
 
@@ -65,21 +74,75 @@ class Reranker:
         if not candidates:
             return []
 
-        # 準備 (query, document) pairs
-        pairs = []
+        # 擷取內容
+        documents = []
         for c in candidates:
             content = c.get("content", "") or c.get("payload", {}).get("content_preview", "")
-            # 截斷過長的內容
-            if len(content) > 512:
+            if len(content) > 512 and self.config.provider == "local":
                 content = content[:512]
-            pairs.append((query, content))
+            documents.append(content)
 
-        # 批量預測分數
-        scores = self.model.predict(pairs, batch_size=self.config.batch_size)
+        scores = []
+
+        # 1. 如果是 Voyage AI API
+        if self.config.provider == "voyage":
+            try:
+                import voyageai
+                client = voyageai.Client(api_key=self._api_client.api_key)
+                rerank_res = client.rerank(
+                    query=query,
+                    documents=documents,
+                    model=self.config.model_name,
+                    top_k=top_m
+                )
+                # 初始化 scores，將所有 candidates 設為 0
+                scores = [0.0] * len(candidates)
+                for res in rerank_res.results:
+                    scores[res.index] = res.relevance_score
+            except Exception as e:
+                print(f"Voyage rerank API failed: {e}. Falling back to original scores.")
+                scores = [c.get("score", 0.0) for c in candidates]
+
+        # 2. 如果是其他 OpenAI compatible 的 provider，且假設他們有 /v1/rerank 端點（如 Jina, Cohere compatible）
+        elif self.config.provider != "local" and self._api_client:
+            try:
+                # Using standard requests as OpenAI client doesn't support /v1/rerank directly yet
+                headers = {"Authorization": f"Bearer {self._api_client.api_key}"}
+                payload = {
+                    "model": self.config.model_name,
+                    "query": query,
+                    "documents": documents,
+                    "top_n": top_m
+                }
+
+                base_url = self._api_client.base_url
+                if str(base_url).endswith("/v1") or str(base_url).endswith("/v1/"):
+                    url = f"{str(base_url).rstrip('/')}/rerank"
+                else:
+                    url = f"{str(base_url).rstrip('/')}/v1/rerank"
+
+                resp = requests.post(url, headers=headers, json=payload, timeout=10)
+                if resp.status_code == 200:
+                    results = resp.json().get("results", [])
+                    scores = [0.0] * len(candidates)
+                    for res in results:
+                        scores[res["index"]] = res["relevance_score"]
+                else:
+                    print(f"Rerank API failed ({resp.status_code}): {resp.text}. Falling back.")
+                    scores = [c.get("score", 0.0) for c in candidates]
+            except Exception as e:
+                print(f"Rerank API failed: {e}. Falling back.")
+                scores = [c.get("score", 0.0) for c in candidates]
+
+        # 3. 如果是 local (sentence-transformers)
+        else:
+            pairs = [(query, doc) for doc in documents]
+            scores = self.model.predict(pairs, batch_size=self.config.batch_size)
+            scores = [float(s) for s in scores]
 
         # 添加 rerank 分數
         for i, score in enumerate(scores):
-            candidates[i]["score_rerank"] = float(score)
+            candidates[i]["score_rerank"] = score
             candidates[i]["score_hybrid"] = candidates[i].get("score", 0)
 
         # 按 rerank 分數排序
@@ -151,16 +214,22 @@ def create_reranker(use_cross_encoder: bool = True) -> Any:
     工廠函數 - 創建 reranker
 
     Args:
-        use_cross_encoder: 是否使用 cross-encoder 模型
+        use_cross_encoder: 是否使用 cross-encoder 模型 (這裡指進階 reranker 包含 api)
 
     Returns:
         Reranker instance
     """
     if use_cross_encoder:
+        cfg = get_component_config("reranker")
+        r_config = RerankerConfig(
+            provider=cfg.provider,
+            model_name=cfg.model,
+        )
+        # 嘗試初始化，若使用 local model 且沒裝函式庫則 fallback
         try:
-            return Reranker()
+            return Reranker(config=r_config)
         except ImportError:
-            print("Warning: sentence-transformers not installed, using SimpleReranker")
+            print("Warning: required libraries not installed, using SimpleReranker")
             return SimpleReranker()
     else:
         return SimpleReranker()
