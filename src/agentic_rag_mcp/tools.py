@@ -43,8 +43,19 @@ def read_exact_file_tool(path: str, lines: str = None) -> str:
     except Exception as e:
         return f"Error reading file: {e}"
 
-def list_directory_tool(path: str) -> List[str]:
+def list_directory_tool(path: str, max_items: int = 50) -> List[str]:
+    ignore_dirs = {".git", "node_modules", "venv", "__pycache__", ".venv", ".idea", ".vscode", "target", "bin", "obj", "dist", "build"}
     try:
-        return os.listdir(path)
+        all_items = os.listdir(path)
+        filtered = [item for item in all_items if item not in ignore_dirs]
+
+        # Sort so directories and files are somewhat consistent
+        filtered.sort()
+
+        result = filtered[:max_items]
+        if len(filtered) > max_items:
+            result.append(f"... (and {len(filtered) - max_items} more items hidden)")
+
+        return result
     except Exception as e:
         return [f"Error listing directory: {e}"]

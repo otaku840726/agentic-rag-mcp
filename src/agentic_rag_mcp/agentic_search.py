@@ -253,6 +253,9 @@ class AgenticSearch:
             tool_results=state.get("tool_results", [])
         )
 
+        # We replace the list entirely (or we can use reducer, but for tools we want exact replacement)
+        # For reducer to replace instead of append, we can structure it differently,
+        # but since we clear it in tool_executor anyway, appending is fine or we just return it.
         return {
             "iteration": iteration,
             "planner_tool_calls": out.tool_calls,
@@ -262,10 +265,10 @@ class AgenticSearch:
 
     def _node_tool_executor(self, state: GraphState) -> Dict[str, Any]:
         tool_calls = state.get("planner_tool_calls", [])
-        search_history = list(state.get("search_history", []))
 
         all_raw_results = []
         new_results = []
+        new_search_history = []
 
         # Execute tool calls
         for tc in tool_calls:
@@ -275,23 +278,25 @@ class AgenticSearch:
             if tool_name == "semantic_search":
                 q = args.get("query", "")
                 if q:
-                    search_history.append(f"semantic_search:{q}")
+                    new_search_history.append(f"semantic_search:{q}")
                     res = semantic_search_tool(q, self.hybrid_search, self.query_builder, self.reranker, top_k=self.config.top_n_search)
                     all_raw_results.extend(res)
             elif tool_name == "graph_symbol_search":
                 symbol = args.get("symbol", "")
                 if symbol:
-                    search_history.append(f"graph:{symbol}")
+                    new_search_history.append(f"graph:{symbol}")
                     res = graph_symbol_search_tool(symbol, self.graph_enhancer.graph_store if self.graph_enhancer else None, args.get("depth", 1))
                     new_results.append({"tool": "graph", "res": str(res)})
             elif tool_name == "read_exact_file":
                 path = args.get("path", "")
                 if path:
+                    new_search_history.append(f"read_file:{path}")
                     res = read_exact_file_tool(path, args.get("lines"))
                     new_results.append({"tool": "read_file", "path": path, "content": res})
             elif tool_name == "list_directory":
                 path = args.get("path", "")
                 if path:
+                    new_search_history.append(f"list_dir:{path}")
                     res = list_directory_tool(path)
                     new_results.append({"tool": "list_dir", "path": path, "content": str(res)})
 
@@ -364,8 +369,9 @@ class AgenticSearch:
             consec_no_new = 0
 
         return {
-            "search_history": search_history,
-            "tool_results": state.get("tool_results", []) + new_results,
+            "search_history": new_search_history,
+            "tool_results": new_results,
+            "planner_tool_calls": [], # Clear tool_calls so we don't carry them over forever
             "consecutive_no_new": consec_no_new,
             "evidence_summary": self.evidence_store.get_summary_for_planner()
         }

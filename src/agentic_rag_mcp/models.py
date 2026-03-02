@@ -160,13 +160,13 @@ class GraphState(TypedDict):
     query: str                                 # 原始查詢
     tech_stack: str                            # 技術棧 (e.g., "Java/Spring", "Node.js")
     intent: str                                # 意圖 (e.g., "Bug 修復", "知識問答")
-    sub_tasks: List[str]                       # 待辦清單 (To-Do)
-    completed_tasks: List[str]                 # 已完成清單
+    sub_tasks: Annotated[List[str], operator.add]             # 待辦清單 (To-Do)
+    completed_tasks: Annotated[List[str], operator.add]       # 已完成清單
     evidence_summary: str                      # 當前證據摘要
     iteration: int                             # 當前迭代次數
-    search_history: List[str]                  # 已搜索的查詢歷史
-    planner_tool_calls: List[Dict[str, Any]]   # Planner 決定的工具調用列表
-    tool_results: List[Dict[str, Any]]         # 工具執行結果
+    search_history: Annotated[List[str], operator.add]        # 已搜索的查詢歷史
+    planner_tool_calls: List[Dict[str, Any]]                   # Planner 決定的工具調用列表 (不 append，每次直接覆蓋)
+    tool_results: List[Dict[str, Any]]                         # 工具執行結果 (不 append，每次直接覆蓋)
     should_stop: bool                          # 是否滿足停機條件
     final_response: Optional[SynthesizedResponse] # 最終生成的回答
     consecutive_no_new: int                    # 連續無新發現次數

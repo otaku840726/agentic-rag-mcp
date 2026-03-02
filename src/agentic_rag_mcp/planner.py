@@ -17,46 +17,106 @@ from .utils import extract_json_from_response, strip_think_tags
 PLANNER_SYSTEM_PROMPT = """你是代碼庫搜索 Planner。
 你的任務是根據「黑板」(GraphState) 上的子任務 (sub_tasks)，決定要調用哪些工具。
 
-**可用工具:**
-1. semantic_search:
-   - 用法: `{"tool": "semantic_search", "args": {"query": "模糊概念"}}`
-   - 說明: 混合搜索，適合尋找模糊概念、邏輯。
-2. graph_symbol_search:
-   - 用法: `{"tool": "graph_symbol_search", "args": {"symbol": "類名/方法名", "depth": 1}}`
-   - 說明: 查找 AST 結構圖，精準尋找方法的調用者或實作。
-3. read_exact_file:
-   - 用法: `{"tool": "read_exact_file", "args": {"path": "檔案路徑", "lines": "10-50"}}`
-   - 說明: 閱讀特定檔案的完整內容或特定行數。
-4. list_directory:
-   - 用法: `{"tool": "list_directory", "args": {"path": "資料夾路徑"}}`
-   - 說明: 探索資料夾結構。
-
 **職責:**
-1. 觀察「待辦清單 (sub_tasks)」。
-2. 決定這一步要調用哪個（或哪些）工具。
-3. 判斷是否所有任務都完成了且證據足夠 (should_stop)。如果足夠，可以將 `should_stop` 設為 true。
+1. 觀察「待辦清單 (sub_tasks)」與當前證據。
+2. 使用提供的工具（Tool Calling API）來收集所需資訊（如 `semantic_search`, `graph_symbol_search`, `read_exact_file` 等）。
+3. **強制要求**: 你必須在每一次回覆中，呼叫 `report_status` 工具，回報目前的決策理由 (rationale)、缺失的證據 (missing_evidence)，以及是否所有任務已完成且證據充足 (should_stop)。
 
-**只輸出 JSON，不要任何解釋。**
-
-**輸出格式:**
-{
-    "should_stop": false,
-    "tool_calls": [
-        {
-            "tool": "semantic_search",
-            "args": {"query": "密碼驗證邏輯"}
-        }
-    ],
-    "missing_evidence": [
-        {
-            "need": "描述缺少什麼",
-            "accept": ["接受條件1", "接受條件2"],
-            "priority": "high|medium|low"
-        }
-    ],
-    "rationale": "簡短的決策理由"
-}
+請直接調用工具，不要產生多餘的文字說明。
 """
+
+PLANNER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "semantic_search",
+            "description": "混合搜索，適合尋找模糊概念、邏輯。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "要搜索的內容或概念"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "graph_symbol_search",
+            "description": "查找 AST 結構圖，精準尋找方法的調用者或實作。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "類名或方法名"},
+                    "depth": {"type": "integer", "description": "探索深度", "default": 1}
+                },
+                "required": ["symbol"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_exact_file",
+            "description": "閱讀特定檔案的完整內容或特定行數。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "檔案路徑"},
+                    "lines": {"type": "string", "description": "行數範圍，例如 '10-50'，留空代表讀取全檔"}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": "探索資料夾結構，列出內容。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "資料夾路徑"}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "report_status",
+            "description": "回報目前的計畫狀態與推論結果。這是一個強制的工具，每次回覆都必須調用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "should_stop": {"type": "boolean", "description": "是否所有任務都完成了且證據足夠"},
+                    "rationale": {"type": "string", "description": "簡短的決策理由"},
+                    "missing_evidence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "need": {"type": "string", "description": "描述缺少什麼"},
+                                "accept": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "接受條件列表"
+                                },
+                                "priority": {"type": "string", "enum": ["high", "medium", "low"]}
+                            },
+                            "required": ["need", "accept", "priority"]
+                        },
+                        "description": "列出目前仍然缺失的證據清單"
+                    }
+                },
+                "required": ["should_stop", "rationale", "missing_evidence"]
+            }
+        }
+    }
+]
 
 
 @dataclass
@@ -131,11 +191,9 @@ class Planner:
             ],
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
+            "tools": PLANNER_TOOLS,
+            "tool_choice": "auto"
         }
-
-        # 非 local provider 才使用 response_format
-        if self.config.provider != "local":
-            kwargs["response_format"] = {"type": "json_object"}
 
         import time
         start_time = time.time()
@@ -144,8 +202,16 @@ class Planner:
         
         latency = (time.time() - start_time) * 1000
 
-        # 解析回應
-        content = response.choices[0].message.content
+        # Log to trace if logger provided
+        if logger and search_id:
+            logger.log_llm_event(
+                search_id=search_id,
+                step=f"planner_iter_{iteration}",
+                model=self.config.model,
+                messages=kwargs["messages"],
+                response=str(response.choices[0].message),
+                latency_ms=latency
+            )
 
         if usage_log is not None and hasattr(response, "usage") and response.usage:
             usage_log.append({
@@ -156,18 +222,7 @@ class Planner:
                 "latency_ms": round(latency),
             })
 
-        # Log to trace if logger provided
-        if logger and search_id:
-            logger.log_llm_event(
-                search_id=search_id,
-                step=f"planner_iter_{iteration}",
-                model=self.config.model,
-                messages=kwargs["messages"],
-                response=content,
-                latency_ms=latency
-            )
-
-        return self._parse_response(content)
+        return self._parse_tool_calls(response.choices[0].message)
 
     def _build_user_prompt(
         self,
@@ -223,54 +278,53 @@ class Planner:
 
         return "\n".join(parts)
 
-    def _parse_response(self, content: str) -> PlannerOutput:
-        """解析 LLM 回應"""
-        try:
-            data = extract_json_from_response(content)
+    def _parse_tool_calls(self, message: Any) -> PlannerOutput:
+        """Parse LLM tool calls response"""
+        out = PlannerOutput(
+            next_queries=[],
+            tool_calls=[],
+            missing_evidence=[],
+            evidence_found=[],
+            rationale="No rationale provided.",
+            should_stop=False
+        )
 
-            # 解析 missing_evidence
-            missing_evidence = []
-            for m in data.get("missing_evidence", []):
-                missing_evidence.append(MissingEvidence(
-                    need=m.get("need", ""),
-                    accept=m.get("accept", []),
-                    priority=m.get("priority", "medium")
-                ))
+        if not hasattr(message, "tool_calls") or not message.tool_calls:
+            # If the model didn't call any tools, fallback to content
+            out.rationale = "Model generated content instead of tool calls."
+            return out
 
-            # 解析 next_queries (向後兼容，如果原本生成 query 的話)
-            next_queries = []
-            for q in data.get("next_queries", []):
-                next_queries.append(QueryIntent(
-                    query=q.get("query", ""),
-                    purpose=q.get("purpose", ""),
-                    query_type=q.get("query_type", "semantic"),
-                    operator=q.get("operator", "semantic"),
-                    filters=q.get("filters")
-                ))
+        for call in message.tool_calls:
+            try:
+                args = json.loads(call.function.arguments)
+            except Exception:
+                continue
 
-            # 解析 tool_calls
-            tool_calls = data.get("tool_calls", [])
+            name = call.function.name
 
-            return PlannerOutput(
-                next_queries=next_queries,
-                tool_calls=tool_calls,
-                missing_evidence=missing_evidence,
-                evidence_found=data.get("evidence_found", []),
-                rationale=data.get("rationale", ""),
-                should_stop=data.get("should_stop", False),
-                symmetry_analysis=data.get("symmetry_analysis", "")
-            )
+            if name == "report_status":
+                out.should_stop = args.get("should_stop", False)
+                out.rationale = args.get("rationale", "")
 
-        except json.JSONDecodeError as e:
-            # 解析失敗時返回默認輸出
-            return PlannerOutput(
-                next_queries=[],
-                tool_calls=[],
-                missing_evidence=[],
-                evidence_found=[],
-                rationale=f"Failed to parse LLM response: {e}",
-                should_stop=True
-            )
+                for m in args.get("missing_evidence", []):
+                    out.missing_evidence.append(MissingEvidence(
+                        need=m.get("need", ""),
+                        accept=m.get("accept", []),
+                        priority=m.get("priority", "medium")
+                    ))
+            elif name in ["semantic_search", "graph_symbol_search", "read_exact_file", "list_directory"]:
+                out.tool_calls.append({"tool": name, "args": args})
+
+        # Backward compatibility for existing code that checks `next_queries` inside the pipeline
+        for tc in out.tool_calls:
+            if tc["tool"] == "semantic_search":
+                q = tc["args"].get("query", "")
+                if q:
+                    out.next_queries.append(QueryIntent(
+                        query=q, purpose="Tool call wrapper", query_type="semantic", operator="hybrid"
+                    ))
+
+        return out
 
     def get_token_count(self, text: str) -> int:
         """估算 token 數量"""
