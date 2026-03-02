@@ -55,6 +55,7 @@ dependencies = [
     "langgraph>=1.0.10",
     "langchain-core>=1.2.16",
     "voyageai>=0.3.7",
+    "pytest>=9.0.2",
 ]
 
 [project.optional-dependencies]

@@ -41,7 +41,7 @@ def process_search_tool(query: str, graph_store) -> Dict[str, Any]:
         cypher = """
         MATCH (p:Process)
         WHERE p.name CONTAINS $query OR p.entry_point CONTAINS $query
-        RETURN p.name AS name, p.entry_point AS entry_point, p.steps AS steps
+        RETURN p.name AS name, p.entry_point AS entry_point, p.file_path AS file_path, p.steps AS steps
         LIMIT 5
         """
         results = graph_store.cypher_query(cypher, {"query": query})
