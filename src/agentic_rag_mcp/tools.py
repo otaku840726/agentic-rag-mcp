@@ -8,8 +8,17 @@ def semantic_search_tool(query: str, hybrid_search, query_builder, reranker, top
     queries = query_builder.build_from_intent(intent)
 
     all_raw_results = []
-    for q in queries:
-        raw = hybrid_search.search(q, operator="hybrid", top_n=50)
+    for q_dict in queries:
+        text_query = q_dict["query"]
+        op = q_dict.get("operator", "hybrid")
+        filters = q_dict.get("filters", {})
+
+        try:
+            raw = hybrid_search.search(text_query, operator=op, filters=filters, top_n=50)
+        except TypeError:
+            # Fallback if filters isn't supported
+            raw = hybrid_search.search(text_query, operator=op, top_n=50)
+
         all_raw_results.extend(raw)
 
     reranked = reranker.rerank(query, all_raw_results, top_m=top_k)
