@@ -510,6 +510,33 @@ class GraphStore:
         except Exception as e:
             logger.error(f"Failed to compute execution flows (APOC plugin might be missing): {e}")
 
+    def delete_project(self, project: Optional[str] = None) -> int:
+        """Delete all nodes and relationships associated with a project.
+
+        Args:
+            project: Project name (defaults to self.default_project)
+
+        Returns:
+            Number of nodes deleted.
+        """
+        proj = project if project is not None else self.default_project
+        query = """
+        MATCH (n)
+        WHERE (n:Symbol OR n:File OR n:Community OR n:Process) AND n.project = $project
+        DETACH DELETE n
+        RETURN count(n) AS deleted_count
+        """
+        try:
+            with self.driver.session(database=self.database) as session:
+                result = session.run(query, project=proj)
+                record = result.single()
+                deleted = record["deleted_count"] if record else 0
+                logger.info(f"Deleted {deleted} nodes for project: {proj}")
+                return deleted
+        except Exception as e:
+            logger.error(f"Failed to delete project {proj}: {e}")
+            raise
+
     # ── Read ──────────────────────────────────────────────────────
 
     def get_neighbors(
