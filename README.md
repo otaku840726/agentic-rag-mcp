@@ -1,512 +1,85 @@
+
 # Agentic RAG MCP Server
 
-An MCP server that gives AI assistants **deep, structural understanding of large codebases** by combining hybrid vector search with an optional code knowledge graph.
+Agentic RAG MCP 是一個為代碼庫量身打造的強大 AI 檢索與問答伺服器。它透過 Model Context Protocol (MCP) 無縫整合至你的開發環境（如 Cursor, Claude Desktop），並結合了最新的 Agentic Workflow 與知識圖譜技術，提供極致精準的代碼導航與修復建議。
 
-- **Hybrid Search** — Dense (semantic) + sparse (BM25) fusion with RRF ranking and cross-encoder reranking
-- **Agentic Multi-Hop** — Iterative planner → analyst → judge → synthesizer loop for complex, cross-service questions
-- **Knowledge Graph** — Optional Neo4j/AuraDB storing AST-extracted symbols and call/inheritance/reference relationships
-- **Graph-Enhanced RAG** — Automatically expands vector search results with structurally-adjacent code from the graph
-- **AST-Aware Chunking** — Tree-sitter (all languages) + Roslyn (.NET) + Spoon (Java) extract symbol-level chunks with full metadata
-- **Multi-Provider** — OpenAI, Gemini, Voyage AI, Vertex AI, OpenRouter, Ollama/vLLM — each component independently configurable
+## 🌟 核心架構 (Agentic Workflow)
 
----
+系統底層採用 LangGraph 狀態機（State Graph）來協調多個專業節點，徹底解決了傳統 RAG 容易迷失上下文的問題：
 
-## Architecture
+* **感知節點 (Context Awareness)**：自動偵測專案的技術棧（如 Java/Spring, Python, C# 等）並初始化共享黑板 (Blackboard)。
+* **分析大腦 (Analyst)**：解析用戶真實意圖，並將複雜問題拆解為具體的子任務 (Sub-tasks)。
+* **決策與行動 (Planner & Executor)**：具備 Tool Calling 能力的代理，能根據任務清單主動決策要呼叫哪些工具（如語義搜尋、讀取檔案、查找圖譜等）來收集證據。
+* **品質守門員 (Quality Gate)**：透過預算 (Budget) 與證據完整度評估，動態決定是要繼續深挖代碼，還是進入總結階段。
+* **總結合成本 (Synthesizer)**：根據收集到的高價值上下文，產出精準的程式碼解析、執行流程圖或 Code Patch 修改建議。
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         MCP Client                              │
-│              (Claude Code / Claude Desktop / etc.)              │
-└───────────────────────────────┬─────────────────────────────────┘
-                                │ MCP (stdio)
-┌───────────────────────────────▼─────────────────────────────────┐
-│                         MCP Server                              │
-│                                                                 │
-│   ┌─────────────────────┐       ┌──────────────────────────┐   │
-│   │   agentic-search    │       │      quick-search        │   │
-│   │   (multi-hop)       │       │   (single-pass, fast)    │   │
-│   └──────────┬──────────┘       └─────────────┬────────────┘   │
-│              │                                │                 │
-│              └─────────────┬──────────────────┘                 │
-│                            │                                    │
-│              ┌─────────────▼──────────────┐                     │
-│              │        HybridSearch        │                     │
-│              │  dense + sparse BM25 + RRF │                     │
-│              └─────────────┬──────────────┘                     │
-│                            │                                    │
-│              ┌─────────────▼──────────────┐                     │
-│              │   CrossEncoder Reranker    │                     │
-│              │  (ms-marco-MiniLM-L-6-v2)  │                     │
-│              └─────────────┬──────────────┘                     │
-│                            │                                    │
-│              ┌─────────────▼──────────────┐                     │
-│              │    GraphSearchEnhancer     │  (optional Neo4j)   │
-│              │  neighbor expansion +      │                     │
-│              │  call-edge evidence        │                     │
-│              └─────────────┬──────────────┘                     │
-│                            │                                    │
-│   ┌────────────────────────▼──────────────────────────────┐    │
-│   │              Agentic LLM Pipeline                     │    │
-│   │   Planner → EnsembleAnalyst → Judge → Synthesizer     │    │
-│   │           (iterates up to max_iterations)             │    │
-│   └───────────────────────────────────────────────────────┘    │
-│                                                                 │
-└────────────────┬────────────────────────────┬───────────────────┘
-                 │                            │
-    ┌────────────▼────────────┐  ┌────────────▼────────────┐
-    │         Qdrant          │  │          Neo4j           │
-    │   dense + sparse        │  │  Symbol + File nodes     │
-    │   vectors + payload     │  │  CALLS / INHERITS / ...  │
-    └─────────────────────────┘  └─────────────────────────┘
-```
+## ✨ 主要功能特點
 
-### Indexing Pipelines
+* **多維度混合檢索 (Hybrid Search)**：結合了 Dense Vector (支援 OpenAI, Voyage-code 等)、Sparse Vector (BM25 / Splade) 以及強大的 Cross-encoder / Voyage Reranker 進行重新排序，確保最相關的程式碼片段名列前茅。
+* **AST 代碼知識圖譜 (Neo4j AuraDB)**：不只依賴字面意義，系統會透過 Roslyn (C#) 或 Spoon (Java) 將代碼解析為抽象語法樹，並將調用鏈 (CALLS)、繼承 (INHERITS)、實作 (IMPLEMENTS) 等關係存入圖資料庫。
+* **進階圖形算法 (Graph Algorithms)**：內建 GDS (Graph Data Science) 支援，能夠執行 Leiden 社群偵測 (Community Detection) 來自動識別業務模組，並能追蹤從 Entry Point 開始的執行流 (Execution Flows)。
+* **兩階段智慧索引 (Two-Phase Indexing)**：支援針對變更檔案的增量索引。第一階段利用專用 Analyzer 處理複雜專案結構，第二階段使用 Tree-sitter 與 Markdown 解析器處理其餘檔案，大幅提升建置效率。
+* **動態工具箱 (Tools Box)**：Agent 可隨時呼叫 `read_exact_file` 展開完整檔案上下文，或使用 `list_directory` 探索專案結構，行為模式更貼近真人資深工程師。
 
-When you run `index-codebase`, two parallel pipelines execute:
+## ⚙️ 環境需求與安裝
+
+本專案使用 `uv` 進行 Python 套件管理，並透過 TypeScript 提供 MCP 橋接。
+
+**基礎依賴：**
+* Python 3.10+ (推薦使用 `uv`)
+* Node.js (供 MCP Server 啟動使用)
+* Qdrant (向量資料庫)
+* Neo4j / AuraDB (圖資料庫，可選但強烈推薦)
+
+**環境變數設定：**
+請複製 `.env.example` 並建立 `.env` 檔案，填入必要的 API Keys：
+```env
+# 提供給 LLM 組件使用的 API Key (如 OpenAI, OpenRouter 或 本地模型)
+OPENAI_API_KEY=your_openai_api_key
+
+# 向量資料庫
+QDRANT_URL=http://localhost:6333
+QDRANT_API_KEY=your_qdrant_api_key
+
+# 圖資料庫 (Neo4j)
+NEO4J_ENABLED=true
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=your_password
+
+# 進階 Reranker (推薦使用 Voyage)
+RERANKER_PROVIDER=voyage
+RERANKER_MODEL=voyage-rerank-2
+VOYAGE_API_KEY=your_voyage_api_key
 
 ```
-index-codebase(directory)
-        │
-        ├── Pipeline A — Qdrant (ALL non-binary files)
-        │       │
-        │       ├─ Language-aware chunking
-        │       │    ├─ .cs .java .py .ts .go ...  → Tree-sitter AST chunks
-        │       │    ├─ .md .mdx                   → Markdown section chunks
-        │       │    ├─ .yaml .yml .json            → YAML/JSON structural chunks
-        │       │    └─ everything else             → plain text chunks
-        │       │
-        │       ├─ Hash-based change detection (only re-embeds changed files)
-        │       ├─ Dense embedding  (your EMBEDDING_PROVIDER / EMBEDDING_MODEL)
-        │       ├─ Sparse BM25      (Qdrant built-in or fastembed SPLADE)
-        │       └─ Upsert → Qdrant collection
-        │
-        └── Pipeline B — AuraDB / Neo4j (project-level AST analysis)
-                │
-                ├─ Detect .sln / pom.xml files whose source files changed
-                ├─ .NET solution   → Roslyn SemanticModel (via Docker)
-                │    └─ CALLS, CREATES, OVERRIDES, REFERENCES (FQN-precise)
-                ├─ Java project    → Spoon analyzer (via Docker)
-                │    └─ MEMBER_OF, INHERITS, IMPLEMENTS, IMPORTS, USES_TYPE
-                └─ Upsert Symbol + File nodes → Neo4j with project-scoped edges
-```
 
-Only changed or new files are reprocessed. Deleted files are cleaned from both databases. Re-running `index-codebase` is safe and idempotent.
+## 🚀 快速開始
 
----
-
-## MCP Tools
-
-| Tool | Description |
-|------|-------------|
-| `agentic-search` | Multi-hop search with iterative planning, ensemble analysis, quality judging, and final synthesis. Best for complex "how does X work?" questions |
-| `quick-search` | Fast single-pass hybrid/semantic/keyword/exact search with lightweight reranking |
-| `analyze-codebase` | AST analysis of a directory → JSON artifacts with symbols & relationships (step 1 of manual pipeline) |
-| `index-codebase` | Incremental indexing into Qdrant + Neo4j with hash-based change detection (runs both pipelines) |
-| `index-status` | Collection stats, indexed file count, embedding model info, last index time |
-| `debug-env` | Dump MCP server environment and configuration for troubleshooting |
-| `graph-neighbors` | Query symbol relationships: callers, callees, inheritance, implementations (requires Neo4j) |
-| `graph-query` | Execute raw Cypher queries on the knowledge graph (requires Neo4j) |
-| `graph-status` | Node/edge counts by type with per-project breakdown (requires Neo4j) |
-| `graph-list-projects` | List all projects indexed in the graph database (requires Neo4j) |
-
-> `graph-*` tools are only registered when `NEO4J_ENABLED=true`.
-
----
-
-## Supported Providers
-
-Every component (embedding, analyst, planner, synthesizer, judge) can independently use any provider.
-All providers use the OpenAI-compatible API format.
-
-| Provider | Key Variable(s) | Best For |
-|----------|----------------|----------|
-| `openai` | `OPENAI_API_KEY` | General purpose; GPT-4o default |
-| `voyage` | `VOYAGE_API_KEY` | **Embedding** — `voyage-code-3` is state-of-the-art for code retrieval |
-| `gemini` | `GEMINI_API_KEY` | Google AI Studio — high context window, cost-effective |
-| `vertex` | `VERTEX_API_KEY`, `VERTEX_PROJECT_ID` | Google Cloud Vertex AI (enterprise IAM) |
-| `openrouter` | `OPENROUTER_API_KEY` | Multi-model gateway — access 100+ models with one key |
-| `local` | `LOCAL_LLM_URL`, `LOCAL_LLM_API_KEY` | Ollama / vLLM / LM Studio — fully offline |
-
-### Embedding Provider Recommendations
-
-| Provider + Model | Dimension | Context | Notes |
-|-----------------|-----------|---------|-------|
-| `voyage` / `voyage-code-3` | 1024 | 16 000 | Best-in-class code retrieval |
-| `openai` / `text-embedding-3-large` | 3072 | 8 191 | Strong general purpose |
-| `openai` / `text-embedding-3-small` | 1536 | 8 191 | Default; fast and cheap |
-| `gemini` / `gemini-embedding-001` | 3072 | 2 048 | Strong multilingual |
-| `local` / `nomic-embed-text` | 768 | 8 192 | Fully offline via Ollama |
-
----
-
-## Installation
-
-### As MCP Server (recommended)
-
-Add to your MCP client config (Claude Code `.mcp.json`, Claude Desktop, etc.):
-
-```json
-{
-  "mcpServers": {
-    "agentic-rag": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": [
-        "--from", "git+https://github.com/your-org/agentic-rag-mcp.git",
-        "agentic-rag-mcp"
-      ],
-      "env": {
-        "QDRANT_URL": "https://your-cluster.cloud.qdrant.io",
-        "QDRANT_API_KEY": "your-qdrant-key",
-        "QDRANT_COLLECTION": "my-codebase",
-        "VOYAGE_API_KEY": "your-voyage-key",
-        "EMBEDDING_PROVIDER": "voyage",
-        "EMBEDDING_MODEL": "voyage-code-3",
-        "EMBEDDING_IDENTIFIER": "voyage-code-3",
-        "EMBEDDING_MAX_TOKENS": "16000",
-        "EMBEDDING_BATCH_SIZE": "128",
-        "OPENAI_API_KEY": "sk-..."
-      }
-    }
-  }
-}
-```
-
-### Local Development
-
+1. **安裝 Python 依賴：**
 ```bash
-git clone <repo-url>
-cd agentic-rag-mcp
-
-# Using uv (recommended)
 uv sync
 
-# Or using pip
-python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
-pip install -e ".[dev]"
 ```
 
-Copy and configure your environment:
 
+2. **安裝 NPM 依賴與建置：**
 ```bash
-cp .env.example .env
-# Edit .env with your API keys and settings
-```
-
----
-
-## Configuration
-
-All configuration is via environment variables. The full reference is in `.env.example`.
-
-### Required
-
-| Variable | Description |
-|----------|-------------|
-| `QDRANT_URL` | Qdrant Cloud or self-hosted URL (e.g. `https://xxx.cloud.qdrant.io`) |
-| `QDRANT_API_KEY` | Qdrant API key |
-| `QDRANT_COLLECTION` | Vector collection name (created automatically on first index) |
-
-Plus at least one LLM provider key and one embedding provider key.
-
-### Embedding
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `EMBEDDING_PROVIDER` | `openai` | Provider name (see Supported Providers) |
-| `EMBEDDING_MODEL` | `text-embedding-3-small` | Model name |
-| `EMBEDDING_IDENTIFIER` | `openai-3-small` | Stable ID for the embedding space — changing this triggers full re-index |
-| `EMBEDDING_MAX_TOKENS` | `512` | Max tokens per chunk sent to embedding API |
-| `EMBEDDING_BATCH_SIZE` | `100` | Chunks per API batch call |
-
-> **Note**: If you change `EMBEDDING_IDENTIFIER`, the server detects the mismatch and automatically recreates the Qdrant collection and re-indexes from scratch.
-
-### LLM Components
-
-Each component can use a different provider and model:
-
-| Component | Provider Env | Model Env | Default Model |
-|-----------|-------------|-----------|---------------|
-| Analyst | `ANALYST_PROVIDER` | `ANALYST_MODEL` | `gpt-4o-mini` |
-| Planner | `PLANNER_PROVIDER` | `PLANNER_MODEL` | `gpt-4o-mini` |
-| Synthesizer | `SYNTHESIZER_PROVIDER` | `SYNTHESIZER_MODEL` | `gpt-4o-mini` |
-| Judge | `JUDGE_PROVIDER` | `JUDGE_MODEL` | `gpt-4o-mini` |
-
-Each also accepts `*_MAX_TOKENS` and `*_TEMPERATURE` overrides (e.g. `ANALYST_MAX_TOKENS=6000`).
-
-### Agentic Search Budget
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ENSEMBLE_ENABLED` | `true` | Run 3-persona parallel analyst ensemble (higher quality, more tokens) |
-
-Budget and quality gates are configured in `config.yaml` (`budget` and `quality_gate` sections).
-
-### Sparse Search
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SPARSE_MODE` | `qdrant-bm25` | `qdrant-bm25` (server-side, fast) \| `splade` (local model) \| `disabled` |
-| `BM25_VOCAB_SIZE` | `30000` | BM25 vocabulary size |
-| `SPLADE_MODEL` | `prithivida/Splade_PP_en_v1` | SPLADE model when mode=splade |
-
-### Neo4j / Knowledge Graph (Optional)
-
-| Variable | Description |
-|----------|-------------|
-| `NEO4J_ENABLED` | `true` to enable graph features (default: `false`) |
-| `NEO4J_URI` | `bolt://localhost:7687` or `neo4j+s://xxx.databases.neo4j.io` |
-| `NEO4J_USERNAME` | Neo4j username (default: `neo4j`) |
-| `NEO4J_PASSWORD` | Neo4j password |
-| `NEO4J_DATABASE` | Database name (default: `neo4j`) |
-| `GRAPH_PROJECT` | Logical project key — multiple codebases can share one DB |
-
-Setup options:
-1. **AuraDB Free** — https://console.neo4j.io → Create Free Instance → copy URI + password
-2. **Docker** — `docker run -d -p 7687:7687 -p 7474:7474 -e NEO4J_AUTH=neo4j/password neo4j:5`
-
-### Index Filtering
-
-The indexer uses an extension whitelist. Customize without code changes:
-
-| Variable | Example | Description |
-|----------|---------|-------------|
-| `INDEX_EXTRA_EXTENSIONS` | `.tf,.hcl,.toml` | Add extensions to the whitelist |
-| `INDEX_REMOVE_EXTENSIONS` | `.json,.xml` | Remove extensions from the whitelist |
-| `INDEX_EXTRA_EXCLUDE_DIRS` | `tmp,logs,artifacts` | Additional directories to skip |
-| `INDEX_EXTRA_EXCLUDE_FILES` | `.generated.cs,.auto.ts` | Additional filename suffix patterns to skip |
-
----
-
-## Usage
-
-### 1. Index Your Codebase
+npm install
+npm run build
 
 ```
-# Full incremental index (recommended — hash-based, safe to re-run)
-index-codebase(directory="/path/to/your/codebase")
 
-# Check indexing status
-index-status()
-```
 
-The first run takes a few minutes depending on codebase size and embedding API speed. Subsequent runs only process changed files.
+3. **進行代碼庫索引 (Indexing)：**
+啟動你的 MCP Client，呼叫 `index_codebase` 工具，或使用測試腳本針對目標目錄進行掃描與圖形建立。
+4. **開始對話：**
+在你的開發環境中直接向 Assistant 提問，例如：「這段支付回調的邏輯中，如果驗證簽名失敗會發生什麼事？請幫我追蹤完整的調用鏈並提供修復建議。」
 
-### 2. Search
+## 🛠️ 配置自定義 (config.yaml)
 
-```
-# Simple lookup — find a class, method, or config value
-quick-search(query="DepositService class definition")
-quick-search(query="tblDeposit entity fields", operator="hybrid")
+你可以透過修改 `src/agentic_rag_mcp/config.yaml` 來精細控制系統行為：
 
-# Complex multi-hop analysis
-agentic-search(query="How does the deposit callback flow work end-to-end?")
-agentic-search(query="What services are affected if I add a field to tblDeposit?")
-```
-
-#### `agentic-search` Parameters
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `query` | string | **required** | Search query in natural language |
-| `max_iterations` | integer | `5` | Maximum search iterations |
-| `llm_provider` | string | config default | Override LLM provider for all components (analyst / planner / synthesizer). See [Supported Providers](#supported-providers) |
-| `llm_model` | string | config default | Override LLM model for all components |
-
-`llm_provider` and `llm_model` can be used independently — specify one or both. When not set, `.env` / `config.yaml` defaults are used and the call reuses the shared singleton agent (zero overhead).
-
-```
-# Test with a different model, keep the same provider
-agentic-search(query="...", llm_model="gpt-4o")
-
-# Switch to a stronger model for a complex question
-agentic-search(query="...", llm_provider="openrouter", llm_model="anthropic/claude-3.5-sonnet")
-
-# Use local Ollama for fast offline testing
-agentic-search(query="...", llm_provider="local", llm_model="qwen2.5-coder:32b")
-
-# No override — uses .env defaults (singleton, no extra init cost)
-agentic-search(query="...")
-```
-
-`quick-search` supports four operators:
-
-| Operator | Description |
-|----------|-------------|
-| `hybrid` | Dense + sparse BM25 fusion via RRF (default, recommended) |
-| `semantic` | Dense embedding similarity only |
-| `keyword` | BM25 sparse only (exact term matching) |
-| `exact` | String match in payload |
-
-### 3. Graph Queries (Neo4j enabled)
-
-```
-# Who calls PublishMerchantCallBack?
-graph-neighbors(symbol="PublishMerchantCallBack", relationship_types=["CALLS"])
-
-# What does DepositService depend on?
-graph-neighbors(symbol="DepositService", depth=2)
-
-# Which files reference tblDeposit?
-graph-query(query="""
-  MATCH (s:Symbol)-[:REFERENCES]->(t:Symbol)
-  WHERE t.name CONTAINS 'tblDeposit'
-  RETURN DISTINCT s.file_path, s.name
-  LIMIT 30
-""")
-
-# All implementations of IDepositService
-graph-neighbors(symbol="IDepositService", relationship_types=["IMPLEMENTS"])
-
-# Graph statistics
-graph-status()
-graph-list-projects()
-```
-
----
-
-## Knowledge Graph Schema
-
-When Neo4j is enabled, the graph stores code structure extracted by Roslyn and Tree-sitter:
-
-### Node Types
-
-| Node | Properties | Source |
-|------|-----------|--------|
-| `Symbol` | `fqn`, `name`, `kind`, `file_path`, `namespace`, `source`, `project` | Roslyn + Tree-sitter |
-| `File` | `path`, `service`, `layer`, `category`, `language`, `project` | Tree-sitter |
-
-`kind` values: `class`, `method`, `interface`, `property`, `enum`, `field`, `constructor`
-
-### Edge Types
-
-| Type | Meaning | Source |
-|------|---------|--------|
-| `MEMBER_OF` | Method/property belongs to class | Tree-sitter |
-| `INHERITS` | Class extends class | Tree-sitter |
-| `IMPLEMENTS` | Class implements interface | Tree-sitter |
-| `IMPORTS` | File imports namespace/type | Tree-sitter |
-| `CALLS` | Method calls method | Roslyn (FQN-precise) |
-| `USES_TYPE` | Property/parameter type reference | Tree-sitter |
-| `REFERENCES` | General symbol reference | Roslyn |
-| `CREATES` | Constructor invocation | Roslyn |
-| `OVERRIDES` | Method overrides base method | Roslyn |
-| `DEFINED_IN` | Symbol defined in file | Both |
-
-> **DI limitation**: Controller → Service calls via dependency injection interfaces (e.g. `IDepositService`) appear as `CALLS` to the interface. Use `IMPLEMENTS` edges to trace to concrete implementations.
-
----
-
-## Project Structure
-
-```
-src/agentic_rag_mcp/
-├── mcp_server.py          # MCP tool registration and dispatch
-├── agentic_search.py      # Multi-hop search orchestration (main loop)
-├── hybrid_search.py       # Dense + sparse hybrid search + RRF fusion
-├── graph_search.py        # Graph-enhanced evidence expansion (Neo4j)
-├── reranker.py            # Cross-encoder reranking (ms-marco-MiniLM)
-├── planner.py             # Query planning — generates sub-queries (LLM)
-├── analyst.py             # Evidence analysis — EnsembleAnalyst (LLM)
-├── synthesizer.py         # Final answer synthesis (LLM)
-├── budget.py              # Stop-condition checker (token / iteration budget)
-├── evidence_store.py      # Evidence card pool with LRU eviction
-├── query_builder.py       # Query expansion and variation generation
-├── search_logger.py       # Search trace logging
-├── models.py              # Data models (EvidenceCard, SearchResult, etc.)
-├── provider.py            # Multi-provider LLM/embedding client factory
-├── config.yaml            # Default configuration (all overridable via env)
-├── utils.py               # Shared utilities (fingerprint, NER, tagging)
-│
-└── indexer/
-    ├── core.py                # IndexerService — orchestrates both pipelines
-    ├── ast_chunker.py         # Tree-sitter AST analysis & semantic chunking
-    ├── chunker.py             # File-level chunker dispatcher
-    ├── markdown_analyzer.py   # Markdown section-aware chunking
-    ├── yaml_analyzer.py       # YAML/JSON structural chunking
-    ├── docker_analyzer.py     # Roslyn (.NET) and Spoon (Java) via Docker
-    ├── two_phase_analysis.py  # Two-phase AST analysis orchestration
-    ├── graph_store.py         # Neo4j client (read/write + Cypher helpers)
-    ├── embedder.py            # Embedding generation with batch + cache
-    ├── embedding_cache.py     # Disk-based embedding cache (avoids re-embedding)
-    ├── qdrant_ops.py          # Qdrant upsert/search/delete operations
-    ├── sparse_embedder.py     # BM25/SPLADE sparse vector generation
-    ├── bm25_tokenizer.py      # BM25 tokenizer
-    ├── project_detector.py    # Detect project type (.sln, pom.xml, etc.)
-    └── analyzer.py            # Analyzer factory (Tree-sitter / Roslyn / Spoon)
-```
-
----
-
-## Dependencies
-
-### Core
-
-| Package | Purpose |
-|---------|---------|
-| `mcp` | Model Context Protocol SDK |
-| `qdrant-client` | Vector database client |
-| `openai` | LLM + embedding API client (OpenAI-compatible) |
-| `sentence-transformers` | Cross-encoder reranking model |
-| `fastembed` | Sparse SPLADE embeddings (optional) |
-| `tree-sitter` + grammars | AST parsing for 15+ languages |
-| `pydantic` | Data validation |
-| `pyyaml` | Config file parsing |
-| `python-dotenv` | `.env` file loading |
-| `xxhash` | Fast file hash for change detection |
-
-### Optional
-
-| Package | Install | Purpose |
-|---------|---------|---------|
-| `neo4j` | `pip install agentic-rag-mcp[graph]` | Knowledge graph client |
-| `google-auth` | `pip install google-auth` | Vertex AI ADC credentials |
-
-### Supported Languages (Tree-sitter)
-
-C#, Java, Python, TypeScript, JavaScript, Go, Kotlin, Rust, Swift, HTML, CSS, JSON, YAML, SQL, Bash
-
----
-
-## Configuration Quick Reference
-
-```bash
-# Minimal setup (OpenAI embedding + LLM)
-QDRANT_URL=https://xxx.cloud.qdrant.io
-QDRANT_API_KEY=...
-QDRANT_COLLECTION=my-codebase
-OPENAI_API_KEY=sk-...
-
-# Voyage AI embedding (best for code)
-VOYAGE_API_KEY=...
-EMBEDDING_PROVIDER=voyage
-EMBEDDING_MODEL=voyage-code-3
-EMBEDDING_IDENTIFIER=voyage-code-3
-EMBEDDING_MAX_TOKENS=16000
-EMBEDDING_BATCH_SIZE=128
-
-# Mix providers: Voyage embed + local LLM for analysis
-LOCAL_LLM_URL=http://localhost:11434/v1
-LOCAL_LLM_API_KEY=not-needed
-ANALYST_PROVIDER=local
-ANALYST_MODEL=qwen2.5-coder:32b
-PLANNER_PROVIDER=local
-PLANNER_MODEL=qwen2.5-coder:32b
-SYNTHESIZER_PROVIDER=local
-SYNTHESIZER_MODEL=qwen2.5-coder:32b
-
-# Enable knowledge graph
-NEO4J_ENABLED=true
-NEO4J_URI=neo4j+s://xxx.databases.neo4j.io
-NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=...
-NEO4J_DATABASE=neo4j
-GRAPH_PROJECT=my-project
-```
-
----
-
-## License
-
-MIT
+* 切換不同節點的 LLM Provider (`analyst`, `planner`, `synthesizer`)。
+* 調整預算控制 `budget.max_iterations` 與 `budget.total_token_budget`。
+* 設定 Quality Gate 的嚴格程度，例如要求必須包含 `call_edge` 才能停止搜尋。
