@@ -296,6 +296,220 @@ class GraphStore:
             session.run(query, path=file_path, project=proj)
         logger.debug(f"Deleted graph data for file: {file_path} (project={proj})")
 
+    # ── Community Detection ────────────────────────────────────────
+
+    def compute_communities(self, project: Optional[str] = None):
+        """Run Leiden community detection on the graph and persist results.
+
+        Uses GDS to project the graph, run Leiden, and write back `communityId` to Symbol nodes.
+        Then, uses LLM to generate readable names for these communities based on their central symbols.
+        """
+        proj = project if project is not None else self.default_project
+
+        # 1. Clean up old community nodes for this project
+        try:
+            with self.driver.session(database=self.database) as session:
+                session.run("""
+                MATCH (c:Community)
+                WHERE c.project = $project
+                DETACH DELETE c
+                """, project=proj)
+                logger.info(f"Cleaned up old Community nodes for project: {proj}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up old Community nodes: {e}")
+
+        # 2. Project graph and run Leiden
+        try:
+            with self.driver.session(database=self.database) as session:
+                # Drop projection if exists
+                session.run("CALL gds.graph.drop('codebase_graph', false) YIELD graphName")
+
+                # Project graph (isolated to current project)
+                project_query = """
+                CALL gds.graph.project(
+                  'codebase_graph',
+                  'MATCH (n) WHERE (n:Symbol OR n:File) AND n.project = $project RETURN id(n) AS id',
+                  'MATCH (s)-[r:CALLS|USES_TYPE|MEMBER_OF]->(t) WHERE s.project = $project AND t.project = $project RETURN id(s) AS source, id(t) AS target, type(r) AS type',
+                  { parameters: { project: $project } }
+                )
+                """
+                session.run(project_query, project=proj)
+
+                # Run Leiden
+                leiden_query = """
+                CALL gds.leiden.write('codebase_graph', { writeProperty: 'communityId' })
+                """
+                session.run(leiden_query)
+
+                logger.info("Successfully ran Leiden community detection via GDS")
+        except Exception as e:
+            logger.error(f"Failed to run community detection (GDS plugin might be missing): {e}")
+            return
+
+        # 3. Extract top symbols for each community
+        communities_query = """
+        MATCH (s:Symbol)
+        WHERE s.communityId IS NOT NULL AND s.project = $project
+        WITH s.communityId AS communityId, s
+        ORDER BY communityId, size((s)-[]-()) DESC
+        WITH communityId, collect(s)[..5] AS top_symbols
+        RETURN communityId, [sym IN top_symbols | {name: sym.name, file_path: sym.file_path, fqn: sym.fqn}] AS top_symbols
+        """
+        communities = []
+        with self.driver.session(database=self.database) as session:
+            for record in session.run(communities_query, project=proj):
+                communities.append({
+                    "communityId": record["communityId"],
+                    "top_symbols": record["top_symbols"]
+                })
+
+        # 4. Label communities using LLM
+        if not communities:
+            return
+
+        from ..provider import get_component_config
+        import json
+        import concurrent.futures
+
+        try:
+            from openai import OpenAI
+            cfg = get_component_config("analyst")
+            client = OpenAI(base_url=cfg.base_url, api_key=cfg.api_key)
+
+            def label_community(comm):
+                comm_id = comm["communityId"]
+                symbols_json = json.dumps(comm["top_symbols"], indent=2)
+                prompt = f"""
+                You are analyzing a codebase graph. Based on the following top central symbols in a community,
+                generate a short, human-readable name (e.g., "Order Processing Module", "Auth Service") that
+                represents the logical module this community belongs to.
+
+                Symbols:
+                {symbols_json}
+
+                Reply ONLY with the module name.
+                """
+                response = client.chat.completions.create(
+                    model=cfg.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=50,
+                    temperature=0.2
+                )
+                comm_name = response.choices[0].message.content.strip().strip('"')
+
+                # Create and link Community node
+                update_query = """
+                MATCH (s:Symbol {communityId: $comm_id, project: $project})
+                MERGE (c:Community {id: toString($comm_id), project: $project})
+                SET c.name = $comm_name
+                MERGE (s)-[:IN_COMMUNITY]->(c)
+                """
+                with self.driver.session(database=self.database) as session:
+                    session.run(update_query, comm_id=comm_id, comm_name=comm_name, project=proj)
+
+            logger.info(f"Labeling {len(communities)} communities...")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                futures = [executor.submit(label_community, comm) for comm in communities]
+
+                for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
+                    future.result()  # raise exceptions if any
+                    if i % 10 == 0 or i == len(communities):
+                        logger.info(f"Labeling progress: {i}/{len(communities)} communities...")
+
+            logger.info(f"Successfully labeled {len(communities)} communities.")
+
+        except Exception as e:
+            logger.error(f"Failed to label communities using LLM: {e}")
+
+    # ── Execution Flow Detection ───────────────────────────────────
+
+    def compute_execution_flows(self, project: Optional[str] = None):
+        """Detect execution flows from entry points and persist as Process nodes.
+
+        Uses apoc.path.expandConfig to trace CALLS relationships from known entry points
+        (e.g., C# [HttpGet], Java @RequestMapping, main methods) up to a max depth.
+        """
+        proj = project if project is not None else self.default_project
+
+        # 1. Clean up old Process nodes for this project
+        try:
+            with self.driver.session(database=self.database) as session:
+                session.run("""
+                MATCH (p:Process)
+                WHERE p.project = $project
+                DETACH DELETE p
+                """, project=proj)
+                logger.info(f"Cleaned up old Process nodes for project: {proj}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up old Process nodes: {e}")
+
+        # 2. Identify Entry Points
+        # Using a simple heuristic for entry points: symbols with specific annotations/names
+        # Note: Depending on the analyzer, annotations might be stored in metadata or fqn.
+        # We also look for common method names like "main" or "Handler"
+        entry_points_query = """
+        MATCH (s:Symbol)
+        WHERE (s.name = 'main' OR s.name ENDS WITH 'Controller'
+           OR s.name ENDS WITH 'Handler'
+           OR s.name ENDS WITH 'Listener')
+          AND s.project = $project
+        RETURN s.fqn AS fqn, s.name AS name
+        """
+
+        try:
+            with self.driver.session(database=self.database) as session:
+                result = session.run(entry_points_query, project=proj)
+                entry_points = [record["fqn"] for record in result]
+
+                if not entry_points:
+                    logger.info("No entry points found for execution flow detection.")
+                    return
+
+                logger.info(f"Found {len(entry_points)} potential entry points for project '{proj}'. Tracing execution flows...")
+
+                # 3. Trace paths using APOC
+                # We trace CALLS relationships up to maxLevel=10
+                trace_query = """
+                UNWIND $entry_points AS ep_fqn
+                MATCH (start:Symbol {fqn: ep_fqn, project: $project})
+                CALL apoc.path.expandConfig(start, {
+                    relationshipFilter: "CALLS>",
+                    labelFilter: "/Symbol",
+                    minLevel: 1,
+                    maxLevel: 10,
+                    uniqueness: "NODE_GLOBAL"
+                })
+                YIELD path
+                WITH start, path, length(path) as len
+                // Only keep paths that end at leaf nodes or reach max depth
+                WHERE len > 1
+                WITH start, path
+                ORDER BY length(path) DESC
+                LIMIT 50 // limit per entry point to avoid explosion
+
+                // Create Process node for each significant path
+                WITH start, path,
+                     [n IN nodes(path) | n.fqn] AS path_steps
+
+                MERGE (p:Process {id: apoc.util.md5(path_steps), project: $project})
+                ON CREATE SET p.name = 'Flow from ' + start.name,
+                              p.entry_point = start.fqn,
+                              p.file_path = start.file_path,
+                              p.steps = path_steps
+
+                WITH p, nodes(path) AS syms
+                UNWIND range(0, size(syms)-1) AS idx
+                WITH p, idx, syms[idx] AS sym
+                MERGE (sym)-[r:STEP_IN_PROCESS]->(p)
+                SET r.order = idx
+                """
+
+                session.run(trace_query, entry_points=entry_points, project=proj)
+                logger.info("Successfully computed execution flows.")
+        except Exception as e:
+            logger.error(f"Failed to compute execution flows (APOC plugin might be missing): {e}")
+
     # ── Read ──────────────────────────────────────────────────────
 
     def get_neighbors(
@@ -342,9 +556,11 @@ class GraphStore:
            OR start.fqn ENDS WITH ('.' + $name))
           AND ($project IS NULL OR start.project = $project)
         WITH start LIMIT 1
+        OPTIONAL MATCH (start)-[:IN_COMMUNITY]->(c:Community)
+        WITH start, c.name AS community_name
         MATCH path = (start){pattern}(neighbor:Symbol)
         WHERE neighbor.kind <> 'external'
-        WITH start, neighbor,
+        WITH start, community_name, neighbor,
              [rel IN relationships(path) | {{
                 type: type(rel),
                 source: startNode(rel).fqn,
@@ -356,15 +572,19 @@ class GraphStore:
             neighbor.kind AS kind,
             neighbor.file_path AS file_path,
             neighbor.namespace AS namespace,
-            edge_list
+            edge_list,
+            community_name
         LIMIT 50
         """
 
         nodes = []
         edges = set()
+        community_name = None
         with self.driver.session(database=self.database) as session:
             result = session.run(query, name=symbol_name, project=proj)
             for record in result:
+                if community_name is None:
+                    community_name = record["community_name"]
                 nodes.append({
                     "fqn": record["fqn"],
                     "name": record["name"],
@@ -381,6 +601,7 @@ class GraphStore:
                 {"type": t, "source": s, "target": tgt}
                 for t, s, tgt in edges
             ],
+            "community": community_name
         }
 
     def get_call_chain(

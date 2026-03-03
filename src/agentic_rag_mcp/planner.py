@@ -43,6 +43,34 @@ PLANNER_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "community_search",
+            "description": "當你想了解專案的宏觀架構，或是尋找特定業務模組（如 'Auth', 'Order'）包含哪些核心類別時，使用此工具。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "模組關鍵字"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "process_search",
+            "description": "查找預先計算好的執行流 (Execution Flow) 或 Process 節點。當問題是「如何執行 X 功能」或需要知道完整的步驟序列時，優先使用此工具。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "流程的關鍵字，例如 'Deposit', 'Order Processing'"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "graph_symbol_search",
             "description": "查找 AST 結構圖，精準尋找方法的調用者或實作。",
             "parameters": {
@@ -312,7 +340,7 @@ class Planner:
                         accept=m.get("accept", []),
                         priority=m.get("priority", "medium")
                     ))
-            elif name in ["semantic_search", "graph_symbol_search", "read_exact_file", "list_directory"]:
+            elif name in ["semantic_search", "graph_symbol_search", "process_search", "community_search", "read_exact_file", "list_directory"]:
                 out.tool_calls.append({"tool": name, "args": args})
 
         # Backward compatibility for existing code that checks `next_queries` inside the pipeline

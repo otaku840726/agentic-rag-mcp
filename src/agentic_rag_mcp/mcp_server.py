@@ -404,6 +404,23 @@ if MCP_AVAILABLE:
                     }
                 ),
                 Tool(
+                    name="graph-community-search",
+                    description="""
+                    Search for logical modules (Community nodes) in the graph.
+                    This is useful when you want to understand the macro architecture or find which core classes belong to a specific business module (e.g. 'Auth', 'Order').
+                    """,
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Keyword for the module name"
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                ),
+                Tool(
                     name="graph-neighbors",
                     description="""
                     Get related symbols for a given symbol name from the code knowledge graph.
@@ -434,6 +451,23 @@ if MCP_AVAILABLE:
                             }
                         },
                         "required": ["symbol"]
+                    }
+                ),
+                Tool(
+                    name="graph-process-search",
+                    description="""
+                    Search for execution flows (Process nodes) in the graph.
+                    This is useful when you need to know "how a feature works end-to-end" or the complete call sequence.
+                    """,
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Keyword to search in Process name or entry point (e.g. 'Deposit', 'LoginController')"
+                            }
+                        },
+                        "required": ["query"]
                     }
                 ),
                 Tool(
@@ -623,6 +657,77 @@ if MCP_AVAILABLE:
                 return [TextContent(type="text", text="\n".join(parts))]
             except Exception as e:
                 return [TextContent(type="text", text=f"Graph neighbors error: {e}")]
+
+        elif name == "graph-community-search":
+            gs = get_graph_store()
+            if gs is None:
+                return [TextContent(type="text", text="Error: Neo4j is not enabled or not reachable")]
+            query = arguments.get("query", "")
+            if not query:
+                return [TextContent(type="text", text="Error: query is required")]
+            from .tools import community_search_tool
+            try:
+                result = community_search_tool(query, gs)
+
+                if "error" in result:
+                    return [TextContent(type="text", text=f"Error searching communities: {result['error']}")]
+
+                parts = [f"## Modules (Communities) for: '{query}'\n"]
+                communities = result.get("communities", [])
+
+                if not communities:
+                    parts.append("No matching modules found.")
+                else:
+                    for i, c in enumerate(communities, 1):
+                        parts.append(f"### {i}. {c.get('module_name', 'Unknown')}")
+                        top_symbols = c.get('top_symbols', [])
+                        if top_symbols:
+                            parts.append("**Core Symbols:**")
+                            for sym in top_symbols:
+                                parts.append(f"- `{sym}`")
+                        parts.append("\n---\n")
+
+                return [TextContent(type="text", text="\n".join(parts))]
+            except Exception as e:
+                return [TextContent(type="text", text=f"Graph community search error: {e}")]
+
+        elif name == "graph-process-search":
+            gs = get_graph_store()
+            if gs is None:
+                return [TextContent(type="text", text="Error: Neo4j is not enabled or not reachable")]
+            query = arguments.get("query", "")
+            if not query:
+                return [TextContent(type="text", text="Error: query is required")]
+            from .tools import process_search_tool
+            try:
+                result = process_search_tool(query, gs)
+
+                if "error" in result:
+                    return [TextContent(type="text", text=f"Error searching processes: {result['error']}")]
+
+                parts = [f"## Execution Flows for: '{query}'\n"]
+                processes = result.get("processes", [])
+
+                if not processes:
+                    parts.append("No matching execution flows found.")
+                else:
+                    for i, p in enumerate(processes, 1):
+                        parts.append(f"### Flow {i}: {p.get('name', 'Unknown')}")
+                        parts.append(f"**Entry Point:** `{p.get('entry_point', 'Unknown')}`")
+                        file_path = p.get('file_path')
+                        if file_path:
+                            parts.append(f"**File:** `{file_path}`")
+
+                        steps = p.get('steps', [])
+                        if steps:
+                            parts.append("**Steps:**")
+                            for j, step in enumerate(steps, 1):
+                                parts.append(f"{j}. `{step}`")
+                        parts.append("\n---\n")
+
+                return [TextContent(type="text", text="\n".join(parts))]
+            except Exception as e:
+                return [TextContent(type="text", text=f"Graph process search error: {e}")]
 
         elif name == "graph-list-projects":
             gs = get_graph_store()
