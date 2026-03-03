@@ -285,19 +285,19 @@ class AgenticSearch:
                 symbol = args.get("symbol", "")
                 if symbol:
                     new_search_history.append(f"graph:{symbol}")
-                    res = graph_symbol_search_tool(symbol, self.graph_enhancer.graph_store if self.graph_enhancer else None, args.get("depth", 1))
+                    res = graph_symbol_search_tool(symbol, self.graph_enhancer.graph if self.graph_enhancer else None, args.get("depth", 1))
                     new_results.append({"tool": "graph", "res": str(res)})
             elif tool_name == "process_search":
                 q = args.get("query", "")
                 if q:
                     new_search_history.append(f"process:{q}")
-                    res = process_search_tool(q, self.graph_enhancer.graph_store if self.graph_enhancer else None)
+                    res = process_search_tool(q, self.graph_enhancer.graph if self.graph_enhancer else None)
                     new_results.append({"tool": "process", "res": str(res)})
             elif tool_name == "community_search":
                 q = args.get("query", "")
                 if q:
                     new_search_history.append(f"community:{q}")
-                    res = community_search_tool(q, self.graph_enhancer.graph_store if self.graph_enhancer else None)
+                    res = community_search_tool(q, self.graph_enhancer.graph if self.graph_enhancer else None)
                     new_results.append({"tool": "community", "res": str(res)})
             elif tool_name == "read_exact_file":
                 path = args.get("path", "")
