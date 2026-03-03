@@ -1015,6 +1015,75 @@ class IndexerService:
             resp["warning"] = warning
         return resp
 
+    def clean_index(self) -> Dict[str, Any]:
+        """清除當前項目的索引數據（包括 Qdrant 和 Neo4j/AuraDB），並刪除本地的 AST 緩存。
+        保留本地 Embedding 緩存以節省雲端 API 費用。
+        """
+        import shutil
+
+        response = {
+            "qdrant": {"status": "skipped", "message": ""},
+            "neo4j": {"status": "skipped", "message": ""},
+            "local_cache": {"status": "skipped", "message": ""}
+        }
+
+        # 1. 刪除 Qdrant Collection
+        try:
+            # Check if collection exists first
+            info = self.qdrant.get_collection_info()
+            if "error" not in info and info.get("exists", False):
+                self.qdrant.delete_collection()
+                response["qdrant"]["status"] = "success"
+                response["qdrant"]["message"] = f"Collection {self.qdrant.collection_name} deleted."
+                # 重新標記未初始化
+                self._collection_initialized = False
+            else:
+                response["qdrant"]["status"] = "success"
+                response["qdrant"]["message"] = f"Collection {self.qdrant.collection_name} does not exist."
+        except Exception as e:
+            response["qdrant"]["status"] = "error"
+            response["qdrant"]["message"] = str(e)
+
+        # 2. 刪除 Neo4j Project 數據
+        if self.graph_store:
+            try:
+                deleted_count = self.graph_store.delete_project()
+                response["neo4j"]["status"] = "success"
+                response["neo4j"]["message"] = f"Deleted {deleted_count} nodes for project: {self.graph_store.default_project}."
+            except Exception as e:
+                response["neo4j"]["status"] = "error"
+                response["neo4j"]["message"] = str(e)
+        else:
+            response["neo4j"]["message"] = "Graph store not enabled."
+
+        # 3. 刪除本地緩存（除了 embeddings）
+        try:
+            cache_dir = self.base_dir / ".agentic-rag-cache"
+            deleted_items = []
+
+            # 刪除 analysis 文件夾
+            analysis_dir = cache_dir / "analysis"
+            if analysis_dir.exists():
+                shutil.rmtree(analysis_dir)
+                deleted_items.append("analysis/")
+
+            # 重置 global state
+            if self._global_state_path.exists():
+                self._global_state_path.unlink()
+                deleted_items.append("global-state.json")
+
+            if deleted_items:
+                response["local_cache"]["status"] = "success"
+                response["local_cache"]["message"] = f"Deleted: {', '.join(deleted_items)}."
+            else:
+                response["local_cache"]["status"] = "success"
+                response["local_cache"]["message"] = "No local cache items found to delete."
+        except Exception as e:
+            response["local_cache"]["status"] = "error"
+            response["local_cache"]["message"] = str(e)
+
+        return response
+
     def post_processing(self):
         """Run post-processing steps like community detection and execution flow detection after indexing."""
         if self.graph_store:

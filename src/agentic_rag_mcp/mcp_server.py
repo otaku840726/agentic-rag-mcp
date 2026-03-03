@@ -364,6 +364,22 @@ if MCP_AVAILABLE:
                 }
             ),
             Tool(
+                name="clean-index",
+                description="""
+                Clean up indexing data for the current project.
+
+                This tool performs the following actions:
+                - Deletes the entire Qdrant collection specified by QDRANT_COLLECTION.
+                - Deletes all nodes and relationships in Neo4j (AuraDB) associated with GRAPH_PROJECT.
+                - Deletes local AST analysis cache.
+                - Preserves local embedding cache (.agentic-rag-cache/embeddings) to save API costs on re-index.
+                """,
+                inputSchema={
+                    "type": "object",
+                    "properties": {}
+                }
+            ),
+            Tool(
                 name="debug-env",
                 description="Debug tool to check MCP server environment",
                 inputSchema={
@@ -607,6 +623,11 @@ if MCP_AVAILABLE:
             if "warning" in result:
                 slim["warning"] = result["warning"]
             return [TextContent(type="text", text=json.dumps(slim, indent=2, ensure_ascii=False))]
+
+        elif name == "clean-index":
+            svc = get_indexer_service()
+            result = svc.clean_index()
+            return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
         elif name == "debug-env":
             import os
