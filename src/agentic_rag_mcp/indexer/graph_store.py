@@ -351,7 +351,7 @@ class GraphStore:
         MATCH (s:Symbol)
         WHERE s.communityId IS NOT NULL AND s.project = $project
         WITH s.communityId AS communityId, s
-        ORDER BY communityId, size((s)-[]-()) DESC
+        ORDER BY communityId, COUNT { (s)-[]-() } DESC
         WITH communityId, collect(s)[..5] AS top_symbols
         RETURN communityId, [sym IN top_symbols | {name: sym.name, file_path: sym.file_path, fqn: sym.fqn}] AS top_symbols
         """
