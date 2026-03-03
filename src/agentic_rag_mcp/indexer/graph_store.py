@@ -326,7 +326,7 @@ class GraphStore:
 
                 # Project graph (isolated to current project)
                 project_query = """
-                CALL gds.graph.project(
+                CALL gds.graph.project.cypher(
                   'codebase_graph',
                   'MATCH (n) WHERE (n:Symbol OR n:File) AND n.project = $project RETURN id(n) AS id',
                   'MATCH (s)-[r:CALLS|USES_TYPE|MEMBER_OF]->(t) WHERE s.project = $project AND t.project = $project RETURN id(s) AS source, id(t) AS target, type(r) AS type',
