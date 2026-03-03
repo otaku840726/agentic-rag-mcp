@@ -13,6 +13,7 @@ class SourceKind(str, Enum):
     CONFIG = "config"
     SQL = "sql"
     JIRA = "jira"
+    CALL_TREE = "call_tree"
 
 
 class QueryOperator(str, Enum):
