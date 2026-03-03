@@ -350,11 +350,11 @@ class AgenticSearch:
                     symbol=None,
                     snippet=snippet,
                     chunk_text=content,
-                    score_hybrid=1.0,
-                    score_rerank=1.0,
+                    score_hybrid=2.0,  # 改為 2.0 保證不被淘汰
+                    score_rerank=2.0,  # 改為 2.0 賦予頂級權重
                     tags=[res["tool"]],
                     round_found=state["iteration"],
-                    source_kind="code",
+                    source_kind="call_tree",  # 改為 "call_tree" 讓 Synthesizer 更好辨識
                     span="graph",
                     fingerprint=fingerprint
                 )
