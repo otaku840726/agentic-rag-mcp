@@ -54,14 +54,37 @@ def process_search_tool(query: str, graph_store) -> Dict[str, Any]:
     if not graph_store:
         return {"error": "Graph store not available or Neo4j disabled"}
     try:
-        # Simple match using APOC or direct Cypher to find matching Process nodes
+        # Match matching Process nodes and their associated steps
         cypher = """
         MATCH (p:Process)
         WHERE toLower(p.name) CONTAINS toLower($query) OR toLower(p.entry_point) CONTAINS toLower($query)
-        RETURN p.name AS name, p.entry_point AS entry_point, p.file_path AS file_path, p.steps AS steps
-        LIMIT 5
+        WITH p LIMIT 5
+        OPTIONAL MATCH (s:Symbol)-[r:STEP_IN_PROCESS]->(p)
+        WITH p, s, r
+        ORDER BY r.order ASC
+        WITH p, collect({
+            name: s.name,
+            fqn: s.fqn,
+            file_path: COALESCE(s.file_path, '(External/Library)')
+        }) AS detailed_steps
+        RETURN p.name AS name, p.entry_point AS entry_point, p.file_path AS file_path, detailed_steps
         """
         results = graph_store.cypher_query(cypher, {"query": query})
+
+        # Format steps in python before returning
+        for process in results:
+            formatted_steps = []
+            detailed_steps = process.pop("detailed_steps", [])
+            for step in detailed_steps:
+                if step.get("name") and step.get("fqn"):
+                     name = step["name"]
+                     filepath = step["file_path"]
+                     formatted_steps.append(f"{name} (filepath: {filepath})")
+
+            # If no detailed steps were found (e.g. relation doesn't exist or query failed to join),
+            # fallback to returning something or empty list. The `mcp_server` code expects `steps` as list of strings.
+            process["steps"] = formatted_steps
+
         return {"processes": results}
     except Exception as e:
         return {"error": str(e)}
