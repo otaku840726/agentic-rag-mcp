@@ -22,6 +22,7 @@ class ComponentConfig:
     model: str
     max_tokens: int = 4000
     temperature: float = 0.1
+    identifier: str = "" # 【補上：索引器關鍵屬性】
 
 class ConfigLoader:
     _instance = None
@@ -69,7 +70,8 @@ def get_component_config(name: str) -> ComponentConfig:
         provider=cfg.get("provider", "openai"),
         model=cfg.get("model", "gpt-4o-mini"),
         max_tokens=int(cfg.get("max_tokens", 4000)),
-        temperature=float(cfg.get("temperature", 0.1))
+        temperature=float(cfg.get("temperature", 0.1)),
+        identifier=cfg.get("identifier", "") # 【補上：正確讀取】
     )
 
 def get_section_config(section: str) -> Dict[str, Any]:
@@ -98,16 +100,13 @@ class ProviderFactory:
         client = OpenAI(api_key=cfg.api_key, base_url=cfg.base_url)
         
         # ──【底層 Token 防護罩】──
-        # 針對部分模型物理限制，防止環境變數導致的 400 錯誤
         original_create = client.chat.completions.create
-        
         def safe_create(*args, **kwargs):
             if "max_tokens" in kwargs and kwargs["max_tokens"]:
-                # 裁切過大的 max_tokens，確保 API 可用性
                 kwargs["max_tokens"] = min(kwargs["max_tokens"], 100000)
             return original_create(*args, **kwargs)
-            
         client.chat.completions.create = safe_create
+        
         return client
 
 _factory = None
@@ -119,7 +118,6 @@ def create_client(provider_name: str):
     return _factory.create_client(provider_name)
 
 def create_client_for(component: str) -> Tuple[Any, ComponentConfig]:
-    """一步取得 component 的 client + config"""
     comp_cfg = get_component_config(component)
     client = create_client(comp_cfg.provider)
     return client, comp_cfg
