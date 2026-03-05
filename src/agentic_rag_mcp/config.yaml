@@ -154,6 +154,15 @@ query_templates:
       - 'await {method}'
 
 # ============================================================
+# Graph Post-Processing
+# ============================================================
+graph_processing:
+  community_labeling:
+    batch_size: ${GRAPH_COMMUNITY_BATCH_SIZE:-20}
+    # Whether to perform a global consistency check after drafting
+    global_review: ${GRAPH_COMMUNITY_GLOBAL_REVIEW:-true}
+
+# ============================================================
 # Neo4j / AuraDB Graph Database (Optional)
 # ============================================================
 neo4j:

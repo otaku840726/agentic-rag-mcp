@@ -11,7 +11,7 @@ def test_agentic_search():
     print("🚀 Starting LangGraph Agentic Search Test")
     print("=" * 50)
 
-    query = "UserLogin 拋出的 NullPointerException 怎麼修復？"
+    query = "member deposit create api, merchantCode 應該填什麼？"
     print(f"User Query: {query}\n")
 
     # Initialize the new state graph agent

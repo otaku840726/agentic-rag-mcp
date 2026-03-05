@@ -59,3 +59,8 @@ Thumbs.db
 # Node (for npx wrapper)
 node_modules/
 package-lock.json
+.agentic-rag-cache/
+.gemini/
+.claude/
+.qwen/
+test_*.py

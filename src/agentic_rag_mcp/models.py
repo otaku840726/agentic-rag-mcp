@@ -3,203 +3,214 @@ Data models for Agentic RAG
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, TypedDict, Annotated
+import operator
 from enum import Enum
 
 
 class SourceKind(str, Enum):
-    CODE = "code"
+    FILE = "file"
+    GRAPH = "graph"
     DOC = "doc"
-    CONFIG = "config"
-    SQL = "sql"
-    JIRA = "jira"
-    CALL_TREE = "call_tree"
 
 
-class QueryOperator(str, Enum):
-    SEMANTIC = "semantic"
-    KEYWORD = "keyword"
-    EXACT = "exact"
-    SYMBOL_REF = "symbol_ref"
-    CALLSITE = "callsite"
-
-
-class QueryType(str, Enum):
-    KEYWORD = "keyword"
-    SYMBOL = "symbol"
-    CONFIG = "config"
-    SEMANTIC = "semantic"
-
-
-# ========== Evidence Card ==========
 @dataclass
 class EvidenceCard:
-    """壓縮後的證據卡片"""
-    id: str                                    # chunk id
-    path: str                                  # 文件路徑
-    symbol: Optional[str]                      # class/method/SP name
-    snippet: str                               # 精簡片段 (用於顯示, < 200 chars)
-    chunk_text: str                            # 完整內容 (用於 fingerprint)
-    score_hybrid: float                        # hybrid search 分數
-    score_rerank: float                        # rerank 分數
-    tags: List[str]                            # [timeout, state-machine, robot...]
-    round_found: int                           # 第幾輪找到的
-    source_kind: str                           # "code" | "doc" | "config" | "sql" | "jira"
-    span: str                                  # "L120-L170" 或 chunk offset
-    fingerprint: str                           # 內容 hash (dedupe 用)
-    named_entities: Dict[str, List[str]] = field(default_factory=dict)
-    # {"config_keys": [], "enums": [], "constants": []}
+    """單條證據卡片 (Chunk / Symbol)"""
+    id: str
+    path: str
+    symbol: Optional[str]
+    snippet: str
+    chunk_text: str
+    score_hybrid: float
+    score_rerank: float
+    tags: List[str] = field(default_factory=list)
+    round_found: int = 1
+    source_kind: SourceKind = SourceKind.FILE
+    span: str = ""
+    fingerprint: str = ""
+    community_id: Optional[int] = None
+    named_entities: List[str] = field(default_factory=list)
 
 
-# ========== Query Intent ==========
 @dataclass
 class QueryIntent:
-    """單個查詢意圖"""
-    query: str                                 # 查詢內容
-    purpose: str                               # 目的 (入口/狀態機/config...)
-    query_type: str                            # keyword | symbol | config | semantic
-    operator: str                              # semantic | keyword | exact | symbol_ref | callsite
-    filters: Optional[Dict[str, Any]] = None   # path/module/category 過濾
+    """LLM 識別的搜尋意圖"""
+    query: str
+    purpose: str
+    query_type: str
+    operator: str
+    filters: Dict[str, Any] = field(default_factory=dict)
 
 
-# ========== Missing Evidence ==========
 @dataclass
 class MissingEvidence:
-    """結構化的缺失證據"""
-    need: str                                  # "timeout config source"
-    accept: List[str]                          # ["config key", "default value", "where read"]
-    priority: str                              # "high" | "medium" | "low"
+    """缺失的資訊片段"""
+    need: str
+    accept: List[str]
 
 
-# ========== Analyst Output ==========
-@dataclass
-class AnalystOutput:
-    """Analyst 的結構化輸出"""
-    intent: str                                # 意圖 (e.g., "Bug 修復", "知識問答")
-    subject: str                               # 核心主題
-    actors: List[Dict[str, str]]               # [{"name": "...", "role": "..."}]
-    covered: List[str]                         # 已覆蓋的維度
-    gaps: List[str]                            # 未覆蓋的維度
-    sub_tasks: List[str] = field(default_factory=list) # 拆解的子任務清單
-    reasoning: str = ""                        # 推理過程
-
-
-# ========== Planner Output ==========
 @dataclass
 class PlannerOutput:
-    """Planner 的結構化輸出"""
-    next_queries: List[QueryIntent]            # 下一輪要查什麼
-    missing_evidence: List[MissingEvidence]    # 還缺哪些關鍵證據
-    evidence_found: List[str]                  # 這輪找到哪些 (evidence card ids)
-    rationale: str                             # 決策理由 (簡短)
-    should_stop: bool = False                  # Planner 認為是否應該停止
-    symmetry_analysis: str = ""                # 對稱性思考結果（保留向後兼容）
-    tool_calls: List[Dict[str, Any]] = field(default_factory=list) # [{tool: 'name', args: {...}}]
+    """Planner LLM 的決策輸出"""
+    next_queries: List[str]
+    missing_evidence: List[MissingEvidence]
+    evidence_found: List[str]
+    rationale: str
+    should_stop: bool
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
 
 
-# ========== Evidence Reference ==========
+@dataclass
+class AnalystOutput:
+    """Analyst LLM 的分解輸出"""
+    subject: str
+    actors: List[str]
+    covered: List[str]
+    gaps: List[str]
+    sub_tasks: List[str]
+    reasoning: str
+    intent: str = "Knowledge Discovery"
+
+
+# ========== 基礎組件 (必須放在 SynthesizedResponse 之前) ==========
+
+@dataclass
+class FlowStep:
+    """步驟鏈中的單步"""
+    step: int = 0
+    description: str = ""
+    code_ref: str = ""
+
+
+@dataclass
+class DecisionPoint:
+    """分支條件"""
+    condition: str = ""
+    true_branch: str = ""
+    false_branch: str = ""
+    code_ref: str = ""
+
+
+@dataclass
+class ConfigItem:
+    """配置項 (順序必須符合 synthesizer.py: key, default_value, source, description)"""
+    key: str = ""
+    default_value: str = ""
+    source: str = ""
+    description: str = ""
+    value: str = "" # synthesizer 雖然沒傳，但為了完整性保留在最後
+
+
 @dataclass
 class EvidenceRef:
-    """證據引用"""
-    card_id: str
-    path: str
-    span: str
-    quote: str                                 # 120-200 chars
+    """最終答案中的證據引用"""
+    card_id: str = ""
+    path: str = ""
+    span: str = ""
+    quote: str = ""
     needs_expand: bool = False
     expand_reasons: List[str] = field(default_factory=list)
 
 
-# ========== Flow Step ==========
-@dataclass
-class FlowStep:
-    """步驟鏈中的單步"""
-    step: int
-    description: str
-    code_ref: str                              # card_id + path + span
-
-
-# ========== Decision Point ==========
-@dataclass
-class DecisionPoint:
-    """分支條件"""
-    condition: str
-    true_branch: str
-    false_branch: str
-    code_ref: str
-
-
-# ========== Config Item ==========
-@dataclass
-class ConfigItem:
-    """配置項"""
-    key: str
-    default_value: Optional[str]
-    source: str                                # path where defined
-    description: str
-
-
-# ========== Synthesized Response ==========
 @dataclass
 class SynthesizedResponse:
-    """最終整合的回應"""
-    answer: str                                # 結論
-    flow: List[FlowStep]                       # 步驟鏈 A → B → C
-    decision_points: List[DecisionPoint]       # 分支條件
-    config: List[ConfigItem]                   # 配置來源與預設值
-    evidence: List[EvidenceRef]                # 證據引用
-    search_history: List[str]                  # 搜索歷史
-    iterations: int                            # 迭代次數
-    total_evidence_found: int                  # 總共找到的證據數
+    """
+    最終產出的結構化回答
+    順序必須完全符合 synthesizer.py 呼叫：
+    answer, flow, decision_points, config, evidence, search_history, iterations, total_evidence_found
+    """
+    answer: str = ""
+    flow: List[FlowStep] = field(default_factory=list)
+    decision_points: List[DecisionPoint] = field(default_factory=list)
+    config: List[ConfigItem] = field(default_factory=list)
+    evidence: List[EvidenceRef] = field(default_factory=list)
+    search_history: List[str] = field(default_factory=list)
+    iterations: int = 0
+    total_evidence_found: int = 0
+    
+    # 舊有欄位保留(設為選填)以相容其他代碼
+    key_files: List[str] = field(default_factory=list)
+    confidence: float = 0.0
+    evidence_ids: List[str] = field(default_factory=list)
+
+
+# ========== Worker State ==========
+@dataclass
+class SubTask:
+    """由 Analyst 派發給 Worker 的子任務"""
+    id: str
+    description: str
+    assigned_domain: str
+    status: str = "pending"
+    summary: str = ""
+    evidence_collected: List[EvidenceCard] = field(default_factory=list)
+
+
+class WorkerState(TypedDict):
+    """員工(Worker)的獨立上下文視窗"""
+    task_id: str
+    task_description: str
+    domain_constraint: str
+    query: str
+    iteration: int
+    search_history: Annotated[List[str], operator.add]
+    planner_tool_calls: List[Dict[str, Any]]
+    tool_results: List[Dict[str, Any]]
+    local_evidence: List[EvidenceCard]
+    starting_knowledge: str
+    exclude_cids: List[int]
+    local_findings: str
+    missing_evidence: List[MissingEvidence]
+    critic_feedback: str
+    rejected_ids: List[str]
+    should_stop: bool
+    final_report: str
 
 
 # ========== Search State ==========
-from typing import TypedDict, Annotated
-import operator
-
 class GraphState(TypedDict):
-    """狀態圖的共享狀態 (Blackboard)"""
-    query: str                                 # 原始查詢
-    tech_stack: str                            # 技術棧 (e.g., "Java/Spring", "Node.js")
-    intent: str                                # 意圖 (e.g., "Bug 修復", "知識問答")
-    sub_tasks: Annotated[List[str], operator.add]             # 待辦清單 (To-Do)
-    completed_tasks: Annotated[List[str], operator.add]       # 已完成清單
-    evidence_summary: str                      # 當前證據摘要
-    iteration: int                             # 當前迭代次數
-    search_history: Annotated[List[str], operator.add]        # 已搜索的查詢歷史
-    planner_tool_calls: List[Dict[str, Any]]                   # Planner 決定的工具調用列表 (不 append，每次直接覆蓋)
-    tool_results: List[Dict[str, Any]]                         # 工具執行結果 (不 append，每次直接覆蓋)
-    should_stop: bool                          # 是否滿足停機條件
-    final_response: Optional[SynthesizedResponse] # 最終生成的回答
-    consecutive_no_new: int                    # 連續無新發現次數
-    fallback_triggered: bool                   # 是否已觸發 fallback
-    missing_evidence: List[MissingEvidence]    # (向下兼容) 缺失的證據
+    """LangGraph 共享狀態"""
+    query: str
+    module_map: str
+    intent: str
+    sub_tasks: List[SubTask]
+    worker_reports: Annotated[List[str], operator.add]
+    search_history: Annotated[List[str], operator.add]
+    rejected_ids: List[str]
+    final_response: Optional[SynthesizedResponse]
 
 
-# ========== Quality Gate ==========
+# ========== Config Models ==========
 @dataclass
-class QualityGate:
-    """質量門檻"""
-    min_code_evidence: int = 2
-    min_tag_diversity: int = 2
-    require_call_edge: bool = True
-    require_named_entity: bool = True
-
-
-# ========== Budget ==========
-@dataclass
-class Budget:
-    """預算配置"""
+class AgenticSearchConfig:
+    """搜尋配置"""
     max_iterations: int = 5
-    max_tokens_per_round: int = 2000
-    total_token_budget: int = 15000
-    max_evidence_cards: int = 200
-    working_set_size: int = 20
+    top_n_search: int = 20
+    total_token_budget: int = 60000
+    search_id: str = ""
+
+
+@dataclass
+class SynthesizerConfig:
+    """合成配置"""
+    provider: str = "openai"
+    model: str = "gpt-4o-mini"
+    max_tokens: int = 4000
+    temperature: float = 0.1
+
+
+@dataclass
+class PlannerConfig:
+    """規劃器配置"""
+    max_iterations: int = 5
+    temperature: float = 0.1
 
 
 # ========== Search Result (MCP Response) ==========
 @dataclass
 class SearchResult:
-    """MCP 搜索結果"""
+    """MCP 搜尋結果"""
     success: bool
     response: Optional[SynthesizedResponse] = None
     error: Optional[str] = None

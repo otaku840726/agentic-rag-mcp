@@ -17,21 +17,42 @@ def strip_think_tags(content: str) -> str:
 
 
 def extract_json_from_response(content: str) -> dict:
-    """從 LLM 回應中提取並解析 JSON
-
-    流程: strip think tags -> 定位 JSON -> parse
-    Raises json.JSONDecodeError if no valid JSON found.
-    """
+    """從 LLM 回應中提取並解析 JSON (強效版)"""
+    if not content:
+        return {}
+        
     content = strip_think_tags(content).strip()
 
-    if not content.startswith('{'):
-        json_start = content.find('{')
-        if json_start >= 0:
-            json_end = content.rfind('}')
-            if json_end > json_start:
-                content = content[json_start:json_end + 1]
+    # 1. 嘗試直接解析
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
 
-    return json.loads(content)
+    # 2. 尋找 Markdown 代碼塊
+    md_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+    if md_match:
+        try:
+            return json.loads(md_match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # 3. 暴力搜尋最後一個大括號配對 (應對截斷)
+    json_blocks = re.findall(r'\{.*\}', content, re.DOTALL)
+    if json_blocks:
+        # 取最長的一個，通常是目標 JSON
+        longest_block = max(json_blocks, key=len)
+        try:
+            return json.loads(longest_block)
+        except json.JSONDecodeError:
+            # 嘗試修復截斷的大括號
+            if not longest_block.endswith('}'):
+                try:
+                    return json.loads(longest_block + '}')
+                except:
+                    pass
+
+    return {}
 
 
 # ========== Content Normalization ==========

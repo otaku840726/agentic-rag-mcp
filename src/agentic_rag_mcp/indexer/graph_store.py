@@ -324,16 +324,22 @@ class GraphStore:
                 # Drop projection if exists
                 session.run("CALL gds.graph.drop('codebase_graph', false) YIELD graphName")
 
-                # Project graph (isolated to current project)
+                # Project graph
+                # Note: Leiden requires UNDIRECTED orientation.
                 project_query = """
-                CALL gds.graph.project.cypher(
+                CALL gds.graph.project(
                   'codebase_graph',
-                  'MATCH (n) WHERE (n:Symbol OR n:File) AND n.project = $project RETURN id(n) AS id',
-                  'MATCH (s)-[r:CALLS|USES_TYPE|MEMBER_OF]->(t) WHERE s.project = $project AND t.project = $project RETURN id(s) AS source, id(t) AS target, type(r) AS type',
-                  { parameters: { project: $project } }
+                  ['Symbol', 'File'],
+                  {
+                    CALLS: {orientation: 'UNDIRECTED'},
+                    USES_TYPE: {orientation: 'UNDIRECTED'},
+                    MEMBER_OF: {orientation: 'UNDIRECTED'},
+                    INHERITS: {orientation: 'UNDIRECTED'},
+                    IMPLEMENTS: {orientation: 'UNDIRECTED'}
+                  }
                 )
                 """
-                session.run(project_query, project=proj)
+                session.run(project_query)
 
                 # Run Leiden
                 leiden_query = """
@@ -341,9 +347,9 @@ class GraphStore:
                 """
                 session.run(leiden_query)
 
-                logger.info("Successfully ran Leiden community detection via GDS")
+                logger.info(f"Successfully ran Leiden community detection via GDS for project: {proj}")
         except Exception as e:
-            logger.error(f"Failed to run community detection (GDS plugin might be missing): {e}")
+            logger.error(f"Failed to run community detection: {e}")
             return
 
         # 3. Extract top symbols for each community
@@ -363,64 +369,118 @@ class GraphStore:
                     "top_symbols": record["top_symbols"]
                 })
 
-        # 4. Label communities using LLM
+        # 4. Label communities using LLM (Optimized: Batching + Global Review)
         if not communities:
             return
 
-        from ..provider import get_component_config
+        from ..provider import create_client_for, get_section_config
         import json
-        import concurrent.futures
 
         try:
-            from openai import OpenAI
-            cfg = get_component_config("analyst")
-            client = OpenAI(base_url=cfg.base_url, api_key=cfg.api_key)
+            client, comp_cfg = create_client_for("analyst")
+            graph_cfg = get_section_config("graph_processing")
+            label_cfg = graph_cfg.get("community_labeling", {})
+            
+            community_map = {}  # communityId -> {name, symbols}
 
-            def label_community(comm):
-                comm_id = comm["communityId"]
-                symbols_json = json.dumps(comm["top_symbols"], indent=2)
+            # Phase 1: Batch Drafting (Process communities in batches)
+            batch_size = int(label_cfg.get("batch_size", 20))
+            logger.info(f"Drafting names for {len(communities)} communities in batches of {batch_size}...")
+
+            for i in range(0, len(communities), batch_size):
+                batch = communities[i:i + batch_size]
                 prompt = f"""
-                You are analyzing a codebase graph. Based on the following top central symbols in a community,
-                generate a short, human-readable name (e.g., "Order Processing Module", "Auth Service") that
-                represents the logical module this community belongs to.
+                You are a software architect. Analyze these {len(batch)} code communities.
+                For each community, I provided the top central symbols and their file paths.
+                Generate a short, precise name (3-5 words) for each that reflects its logical responsibility.
 
-                Symbols:
-                {symbols_json}
+                DATA:
+                {json.dumps(batch, indent=2)}
 
-                Reply ONLY with the module name.
+                Return ONLY a JSON object where keys are communityId (string) and values are names.
                 """
-                response = client.chat.completions.create(
-                    model=cfg.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=50,
-                    temperature=0.2
-                )
-                comm_name = response.choices[0].message.content.strip().strip('"')
+                try:
+                    response = client.chat.completions.create(
+                        model=comp_cfg.model,
+                        messages=[
+                            {"role": "system", "content": "Reply with JSON ONLY."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0.1,
+                        response_format={"type": "json_object"} if any(m in comp_cfg.model for m in ["gpt-4", "gpt-3.5", "minimax"]) else None
+                    )
+                    content = response.choices[0].message.content.strip()
+                    # 去除可能的 markdown code blocks
+                    if content.startswith("```json"):
+                        content = content.replace("```json", "").replace("```", "").strip()
+                    elif content.startswith("```"):
+                        content = content.replace("```", "").strip()
+                    
+                    batch_names = json.loads(content)
+                    for comm in batch:
+                        cid = str(comm["communityId"])
+                        name = batch_names.get(cid, "Unnamed Module")
+                        community_map[cid] = {"name": name, "symbols": comm["top_symbols"]}
 
-                # Create and link Community node
-                update_query = """
-                MATCH (s:Symbol {communityId: $comm_id, project: $project})
-                MERGE (c:Community {id: toString($comm_id), project: $project})
-                SET c.name = $comm_name
-                MERGE (s)-[:IN_COMMUNITY]->(c)
+                    logger.info(f"Drafted batch {i//batch_size + 1}/{(len(communities)-1)//batch_size + 1}")
+                except Exception as batch_err:
+                    logger.warning(f"Failed to draft names for batch {i}: {batch_err}")
+
+            # Phase 2: Global Review (Consistency check)
+            do_review = str(label_cfg.get("global_review", "true")).lower() == "true"
+            if do_review and len(community_map) > 1:
+                logger.info("Performing global consistency review for community names...")
+                review_list = {cid: data["name"] for cid, data in community_map.items()}
+                review_prompt = f"""
+                You are a senior software architect. Review these {len(review_list)} detected module names for the project '{proj}'.
+                Identify duplicate names, overly vague names (e.g., "Utilities"), or inconsistent naming styles.
+                Provide a refined mapping that ensures each name is unique and descriptive within the project context.
+
+                CURRENT NAMES:
+                {json.dumps(review_list, indent=2)}
+
+                Return ONLY a JSON object of refined names mapping: {{ communityId: refined_name }}
                 """
-                with self.driver.session(database=self.database) as session:
-                    session.run(update_query, comm_id=comm_id, comm_name=comm_name, project=proj)
+                try:
+                    review_resp = client.chat.completions.create(
+                        model=comp_cfg.model,
+                        messages=[
+                            {"role": "system", "content": "You are an architect. Reply with JSON ONLY."},
+                            {"role": "user", "content": review_prompt}
+                        ],
+                        temperature=0.2,
+                        response_format={"type": "json_object"} if any(m in comp_cfg.model for m in ["gpt-4", "gpt-3.5", "minimax"]) else None
+                    )
+                    content = review_resp.choices[0].message.content.strip()
+                    if content.startswith("```json"):
+                        content = content.replace("```json", "").replace("```", "").strip()
+                    elif content.startswith("```"):
+                        content = content.replace("```", "").strip()
+                        
+                    refined_names = json.loads(content)
+                    for cid, new_name in refined_names.items():
+                        if cid in community_map:
+                            community_map[cid]["name"] = new_name
+                    logger.info("Global review completed.")
+                except Exception as review_err:
+                    logger.warning(f"Global review failed, using drafts: {review_err}")
 
-            logger.info(f"Labeling {len(communities)} communities...")
+            # Phase 3: Persistence (Create Community nodes in Neo4j)
+            logger.info(f"Persisting {len(community_map)} Community nodes...")
+            with self.driver.session(database=self.database) as session:
+                for cid, data in community_map.items():
+                    update_query = """
+                    MATCH (s:Symbol {communityId: toInteger($comm_id), project: $project})
+                    MERGE (c:Community {id: $comm_id, project: $project})
+                    SET c.name = $comm_name
+                    MERGE (s)-[:IN_COMMUNITY]->(c)
+                    """
+                    session.run(update_query, comm_id=cid, comm_name=data["name"], project=proj)
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                futures = [executor.submit(label_community, comm) for comm in communities]
-
-                for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
-                    future.result()  # raise exceptions if any
-                    if i % 10 == 0 or i == len(communities):
-                        logger.info(f"Labeling progress: {i}/{len(communities)} communities...")
-
-            logger.info(f"Successfully labeled {len(communities)} communities.")
+            logger.info(f"Successfully created and labeled {len(community_map)} Community nodes.")
 
         except Exception as e:
-            logger.error(f"Failed to label communities using LLM: {e}")
+            logger.error(f"Failed to label communities: {e}")
 
     # ── Execution Flow Detection ───────────────────────────────────
 
@@ -781,10 +841,17 @@ class GraphStore:
                 projects.append(record["project"])
         return projects
 
-    def close(self):
-        """Close the Neo4j driver."""
-        self.driver.close()
-        logger.info("GraphStore connection closed")
+    def find_bridge(self, start_name: str, end_name: str, project: str = None) -> List[List[str]]:
+        """確定性地驗證兩個符號之間是否有調用或使用路徑"""
+        proj = project or self.default_project
+        query = """
+        MATCH (start:Symbol) WHERE (start.name = $start OR start.fqn = $start) AND start.project = $project
+        MATCH (end:Symbol) WHERE (end.name = $end OR end.fqn = $end) AND end.project = $project
+        MATCH path = shortestPath((start)-[:CALLS|USES_TYPE|MEMBER_OF|IMPLEMENTS|INHERITS*1..5]-(end))
+        RETURN [n IN nodes(path) | n.name] as steps
+        """
+        results = self.cypher_query(query, {"start": start_name, "end": end_name, "project": proj})
+        return [r["steps"] for r in results]
 
     def __enter__(self):
         return self

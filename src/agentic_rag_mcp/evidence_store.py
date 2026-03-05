@@ -213,6 +213,43 @@ class EvidenceStore:
         """獲取所有卡片"""
         return list(self.pool.values())
 
+    def evict_by_ids(self, card_ids: List[str]) -> int:
+        """
+        根據 ID (或 ID 前綴) 手動淘汰證據。
+        Returns: 移除數量
+        """
+        if not card_ids:
+            return 0
+            
+        to_delete = []
+        for fp, card in self.pool.items():
+            if card.id in card_ids or any(card.id.startswith(cid) for cid in card_ids):
+                to_delete.append(fp)
+                
+        for fp in to_delete:
+            del self.pool[fp]
+            
+        return len(to_delete)
+
+    def evict_by_metadata(self, paths: List[str] = None, community_ids: List[int] = None) -> int:
+        """
+        根據元數據（路徑或社群 ID）批量淘汰不相關的證據。
+        """
+        to_delete = []
+        for fp, card in self.pool.items():
+            # 匹配路徑 (前綴匹配)
+            if paths and any(card.path.startswith(p) for p in paths):
+                to_delete.append(fp)
+                continue
+            # 匹配社群 ID
+            if community_ids and card.community_id in community_ids:
+                to_delete.append(fp)
+                
+        for fp in to_delete:
+            del self.pool[fp]
+            
+        return len(to_delete)
+
     def get_stats(self) -> Dict:
         """獲取統計信息"""
         cards = list(self.pool.values())

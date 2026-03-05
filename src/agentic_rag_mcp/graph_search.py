@@ -37,50 +37,58 @@ class GraphSearchEnhancer:
     def expand_evidence(
         self,
         evidence_cards: List["EvidenceCard"],
-        top_k: int = 5,
+        top_k: int = 15, # 增加擴展數量
     ) -> List[Dict[str, Any]]:
-        """Expand evidence with graph neighbors.
-
-        Strategy:
-        1. Extract symbol names from evidence (prefer explicit symbol field over regex)
-        2. Query graph for structural neighbors (inheritance, type usage)
-        3. Collect neighbor file_paths that aren't already in evidence
-        4. Fetch those files from Qdrant as supplementary results
-
-        Focus on precision: only expand with structurally-related code,
-        not every symbol mentioned in snippets.
-        """
+        """利用物理鏈路與社群歸屬，自動拼湊完整業務鄰里。"""
         existing_paths = {card.path for card in evidence_cards}
         symbol_names = self._extract_symbols(evidence_cards)
+        
+        # 收集社群 ID
+        target_communities = {c.community_id for c in evidence_cards if c.community_id is not None}
 
-        if not symbol_names:
+        if not symbol_names and not target_communities:
             return []
 
-        # Query graph for neighbors — focus on structural relationships
-        neighbor_files: Dict[str, float] = {}  # file_path -> relevance score
-        for sym_name in symbol_names[:8]:
-            try:
-                result = self.graph.get_neighbors(
-                    sym_name, depth=1,
-                    relationship_types=_USEFUL_REL_TYPES,
-                )
-                for node in result.get("nodes", []):
-                    fp = node.get("file_path")
-                    kind = node.get("kind", "")
-                    if not fp or fp in existing_paths:
-                        continue
-                    # Skip external/unresolved references
-                    if kind == "external":
-                        continue
-                    # Accumulate score (more connections = more relevant)
-                    neighbor_files[fp] = neighbor_files.get(fp, 0) + 1.0
-            except Exception as e:
-                logger.debug(f"Graph neighbor query failed for {sym_name}: {e}")
+        project = getattr(self.graph, "default_project", "default")
+        neighbor_files: Dict[str, float] = {}
+
+        # 1. [物理連通性擴展] 查詢 2-hop 內的調用者與被調用者
+        if symbol_names:
+            logger.info(f"Deterministic linkage expansion for {len(symbol_names)} symbols...")
+            linkage_query = """
+            MATCH (start:Symbol)
+            WHERE (start.name IN $names OR start.fqn IN $names) AND start.project = $project
+            MATCH (start)-[:CALLS|USES_TYPE|IMPLEMENTS|INHERITS*1..2]-(neighbor:Symbol)
+            WHERE neighbor.file_path IS NOT NULL AND neighbor.project = $project
+            RETURN DISTINCT neighbor.file_path as path, COUNT(*) as weight
+            LIMIT 50
+            """
+            res = self.graph.cypher_query(linkage_query, {"names": symbol_names[:15], "project": project})
+            for r in res:
+                fp = r['path']
+                if fp not in existing_paths:
+                    neighbor_files[fp] = neighbor_files.get(fp, 0) + float(r['weight'])
+
+        # 2. [社群歸屬擴展] 查詢同社群的核心成員 (這是抓取 Advice 的關鍵)
+        if target_communities:
+            logger.info(f"Deterministic community expansion for CIDs: {list(target_communities)}")
+            cid_list = [str(cid) for cid in target_communities] + list(target_communities)
+            community_query = """
+            MATCH (s:Symbol {project: $project})
+            WHERE s.communityId IN $cids OR EXISTS { (s)-[:IN_COMMUNITY]->(c:Community) WHERE c.id IN $cids }
+            RETURN DISTINCT s.file_path as path
+            LIMIT 50
+            """
+            res = self.graph.cypher_query(community_query, {"cids": cid_list, "project": project})
+            for r in res:
+                fp = r['path']
+                if fp and fp not in existing_paths:
+                    neighbor_files[fp] = neighbor_files.get(fp, 0) + 2.0 # 社群成員權重更高
 
         if not neighbor_files:
             return []
 
-        # Sort by relevance and take top_k
+        # Sort by weight and take top_k
         sorted_files = sorted(neighbor_files.items(), key=lambda x: -x[1])
 
         # Fetch content from Qdrant
@@ -93,19 +101,15 @@ class GraphSearchEnhancer:
                         "path": r.get("path", file_path),
                         "content": r.get("content", ""),
                         "score": r.get("score", 0.0),
-                        "score_hybrid": r.get("score_hybrid", 0.0),
+                        "score_hybrid": 1.5, # 賦予高分確保進入工作集
                         "payload": r.get("payload", {}),
                         "source": "graph_expansion",
                     })
             except Exception as e:
-                logger.debug(f"Qdrant fetch failed for graph neighbor {file_path}: {e}")
+                logger.debug(f"Qdrant fetch failed for graph expansion {file_path}: {e}")
 
-        logger.info(
-            f"Graph expansion: {len(symbol_names)} symbols -> "
-            f"{len(neighbor_files)} neighbor files -> "
-            f"{len(supplementary)} supplementary results"
-        )
-        return supplementary[:top_k]
+        logger.info(f"Aggressive Graph expansion added {len(supplementary)} supplementary cards.")
+        return supplementary
 
     def _extract_symbols(self, evidence_cards: List["EvidenceCard"]) -> List[str]:
         """Extract high-confidence symbol names from evidence cards.
