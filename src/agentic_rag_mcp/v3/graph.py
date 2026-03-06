@@ -30,13 +30,40 @@ class V3AgenticSearch:
     def _execute_tool(self, tool_name: str, args: Dict[str, Any]) -> Any:
         try:
             if tool_name == "semantic_search":
-                return semantic_search_tool(args.get("query", ""), self.hybrid_search, self.query_builder, self.reranker, top_k=5, cid=args.get("cid"))
+                raw_res = semantic_search_tool(args.get("query", ""), self.hybrid_search, self.query_builder, self.reranker, top_k=5, cid=args.get("cid"))
+                clean_res = []
+                for r in raw_res:
+                    if isinstance(r, dict):
+                        file_path = r.get("file_path") or r.get("payload", {}).get("file_path", "")
+                        cid_val = r.get("community_id") or r.get("payload", {}).get("community_id", "Unknown")
+                        content = r.get("content") or r.get("payload", {}).get("content", "")
+                        if not content:
+                            content = r.get("content_preview") or r.get("payload", {}).get("content_preview", "")
+                    else:
+                        payload = getattr(r, "payload", {})
+                        file_path = getattr(r, "file_path", payload.get("file_path", ""))
+                        cid_val = getattr(r, "community_id", payload.get("community_id", "Unknown"))
+                        content = getattr(r, "content", payload.get("content", ""))
+                        if not content:
+                            content = getattr(r, "content_preview", payload.get("content_preview", ""))
+                            
+                    clean_res.append({
+                        "file_path": file_path,
+                        "community_id": cid_val,
+                        "snippet": str(content)[:800]
+                    })
+                return clean_res
             elif tool_name == "graph_symbol_search":
                 return graph_symbol_search_tool(args.get("symbol", ""), self.graph_store)
             elif tool_name == "graph_list_files":
                 return graph_list_files_tool(self.graph_store, dir_path=args.get("dir_path"), cid=args.get("cid"), pattern=args.get("pattern"))
             elif tool_name == "read_exact_file":
-                return read_exact_file_tool(args.get("path", ""), hybrid_search=self.hybrid_search)
+                return read_exact_file_tool(
+                    path=args.get("path", ""),
+                    line_start=args.get("line_start"),
+                    line_end=args.get("line_end"),
+                    hybrid_search=self.hybrid_search
+                )
         except Exception as e:
             return f"Tool Execution Error: {str(e)}"
         return "Unknown Tool."
@@ -53,7 +80,10 @@ class V3AgenticSearch:
         def route_manager(state: AgenticState) -> str:
             if state.get("is_finished"):
                 return END
-            return "worker"
+            if state.get("current_task"):
+                return "worker"
+            # 如果 Manager 只是在做 Scouting，沒有派發新任務，則繼續留在 Manager
+            return "manager"
             
         def route_worker(state: AgenticState) -> str:
             if not state.get("current_task"):
@@ -61,7 +91,7 @@ class V3AgenticSearch:
                 return "manager"
             return "worker" # 繼續執行自己發起的連續 Tool Call
             
-        builder.add_conditional_edges("manager", route_manager, {"worker": "worker", END: END})
+        builder.add_conditional_edges("manager", route_manager, {"worker": "worker", "manager": "manager", END: END})
         builder.add_conditional_edges("worker", route_worker, {"manager": "manager", "worker": "worker"})
         
         return builder.compile()

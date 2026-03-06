@@ -19,8 +19,13 @@ YOUR AVAILABLE ACTIONS (Tools):
 
 RULES OF INVESTIGATION:
 - If your manager tells you to find a Call Chain, you must use `read_exact_file` and `graph_symbol_search` to trace the flow.
-- DO NOT report back to the manager until you have actually read the code and extracted quotes, UNLESS you are stuck.
-- If you cannot find a file after trying, or if you hit a dead end, use `report_to_manager` with `has_blocker=true`.
+- **NEVER OUTPUT PLAIN TEXT ANSWERS**: You are not answering the user directly. You are communicating with your Manager. If you find the answer, you MUST use the `report_to_manager` tool to submit your findings. Do not just type the answer in the chat.
+- **CRITICAL ERROR HANDLING**: If `read_exact_file` or `semantic_search` returns an error (like "File not found") or empty results:
+  1. Do NOT try the exact same path/query again.
+  2. Do NOT start randomly searching the root directory `/`.
+  3. Instead, IMMEDIATELY call `report_to_manager` with `has_blocker=true` and tell the Manager what failed so they can give you a new path.
+- **PARTIAL FINDINGS (Time Management)**: If you have called tools many times and traced deep into the code, but haven't found the *complete* answer yet, you can call `report_to_manager` with your **Partial Findings** and `has_blocker=false` or `true` (depending on if you are stuck). It is better to report partial progress than to search endlessly.
+- **SURGICAL READING**: When reading a large file (like a Controller or Service), DO NOT invent a 'search' or 'grep' tool. You ONLY have the 5 tools listed above. If you need to find a specific method, FIRST use `graph_symbol_search` with the Class name to get a list of its methods and their `start_line`/`end_line`, THEN use `read_exact_file` with the `path`, `line_start`, and `line_end` parameters to read only that method.
 """
 
 WORKER_TOOLS = [
@@ -44,15 +49,23 @@ WORKER_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_exact_file",
-            "description": "Read file content.",
-            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+            "description": "Read file content. Specify line_start and line_end to read specific methods.",
+            "parameters": {
+                "type": "object", 
+                "properties": {
+                    "path": {"type": "string"},
+                    "line_start": {"type": "integer"},
+                    "line_end": {"type": "integer"}
+                }, 
+                "required": ["path"]
+            }
         }
     },
     {
         "type": "function",
         "function": {
             "name": "graph_symbol_search",
-            "description": "Find callers/callees or related advices.",
+            "description": "Find callers/callees or get a list of Methods (with start_line/end_line) for a Class.",
             "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}}, "required": ["symbol"]}
         }
     },
@@ -64,8 +77,8 @@ WORKER_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "findings": {"type": "string", "description": "Detailed notes with Code Quotes and Call Chains."},
-                    "has_blocker": {"type": "boolean", "description": "True if you are stuck."}
+                    "findings": {"type": "string", "description": "Detailed notes with Code Quotes and Call Chains. Or Partial Findings if you ran out of time."},
+                    "has_blocker": {"type": "boolean", "description": "True if you are stuck or need a new direction."}
                 },
                 "required": ["findings", "has_blocker"]
             }
@@ -92,9 +105,11 @@ class WorkerAgent:
         current_messages = state.get("current_worker_messages", [])
         
         # 防呆機制：如果 Worker 在同一個工單中呼叫太多次工具（陷入死循環），強迫終止並向主管回報
-        if len(current_messages) > 12:
+        # 放寬至 100，允許深度探索，但保留最後的保險絲
+        if len(current_messages) > 100:
             logger.warning(f"👷 [Worker] Too many tool calls in one task! Forcing report to Manager.")
-            new_log_entry = f"Task: {state['current_task']}\nFindings (Forced Stop):\nWorker reached internal limit (too many tool calls). It might be stuck in a loop."
+            # 這裡我們無法輕易總結 current_messages，只能告訴 Manager 發生了超時
+            new_log_entry = f"Task: {state['current_task']}\nFindings (Forced Stop): Worker executed too many tools (exceeded 50 tool calls). The worker was likely tracing a very deep chain or stuck. Please review the previous task and provide a narrower, more specific scope."
             return {
                 "investigation_log": [new_log_entry],
                 "current_worker_messages": [], 
@@ -118,6 +133,10 @@ class WorkerAgent:
         # 為了保持對話歷史的連續性，需要把 LLM 的回覆也塞進去
         assistant_msg = {"role": "assistant", "content": msg.content or ""}
         
+        # --- [DEBUG] 印出 Worker 的內心獨白 ---
+        if msg.content:
+            print(f"\n🧠 [Worker] Thinking: {msg.content}")
+
         if msg.tool_calls:
             assistant_msg["tool_calls"] = []
             for tc in msg.tool_calls:
@@ -137,8 +156,20 @@ class WorkerAgent:
                 except json.JSONDecodeError:
                     args = {}
                 
+                # 防呆：如果 LLM 發明了不存在的工具
+                valid_tools = ["semantic_search", "graph_list_files", "read_exact_file", "graph_symbol_search", "report_to_manager"]
+                if tool_name not in valid_tools:
+                    logger.warning(f"👷 [Worker] Hallucinated tool '{tool_name}'. Forcing report_to_manager.")
+                    new_log_entry = f"Task: {state['current_task']}\nFindings:\nWorker became stuck trying to invent non-existent tools (like '{tool_name}'). Please rephrase the task or provide a more specific instruction."
+                    return {
+                        "investigation_log": [new_log_entry],
+                        "current_worker_messages": [],
+                        "current_task": ""
+                    }
+                
                 if tool_name == "report_to_manager":
                     logger.info(f"👷 [Worker] Reporting back to Manager. Blocker: {args.get('has_blocker', False)}")
+                    print(f"📝 [Worker] Report to Manager: {args.get('findings', '')[:300]}...")
                     
                     # 只回傳這回合新增的 log 字串，因為 state.py 中 investigation_log 定義為 Annotated[List[str], operator.add]
                     new_log_entry = f"Task: {state['current_task']}\nFindings:\n{args.get('findings', '')}"
@@ -151,11 +182,16 @@ class WorkerAgent:
                 else:
                     logger.info(f"👷 [Worker] Using Tool: {tool_name} with args: {args}")
                     tool_result = self.tool_executor(tool_name, args)
+                    
+                    # --- [DEBUG] 印出 Worker 看到的工具回傳內容 ---
+                    str_result = str(tool_result)
+                    print(f"📥 [Worker] Tool '{tool_name}' returned: {str_result[:500]}...")
+                    
                     new_messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "name": tool_name,
-                        "content": str(tool_result)[:4000] 
+                        "content": str_result[:4000] 
                     })
             # 所有的 tool_call 都執行並附加完畢後再 return
             return {"current_worker_messages": new_messages}

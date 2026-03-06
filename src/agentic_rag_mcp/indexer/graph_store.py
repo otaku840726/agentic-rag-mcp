@@ -673,6 +673,8 @@ class GraphStore:
             neighbor.kind AS kind,
             neighbor.file_path AS file_path,
             neighbor.namespace AS namespace,
+            neighbor.start_line AS start_line,
+            neighbor.end_line AS end_line,
             edge_list,
             community_name
         LIMIT 50
@@ -692,6 +694,8 @@ class GraphStore:
                     "kind": record["kind"],
                     "file_path": record["file_path"],
                     "namespace": record["namespace"],
+                    "start_line": record["start_line"],
+                    "end_line": record["end_line"],
                 })
                 for edge in record["edge_list"]:
                     edges.add((edge["type"], edge["source"], edge["target"]))

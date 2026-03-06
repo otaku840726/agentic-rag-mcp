@@ -68,18 +68,28 @@ def graph_list_files_tool(graph_store, dir_path: str = None, cid: str = None, pa
         return results
     except Exception as e:
         return [{"error": str(e)}]
-
-def read_exact_file_tool(path: str, lines: str = None, hybrid_search=None) -> str:
+def read_exact_file_tool(path: str, line_start: int = None, line_end: int = None, hybrid_search=None) -> str:
     """
     讀取檔案內容 (支援物理讀取與 Qdrant 虛擬備援)
     """
+    # ──【資料淨化】防呆機制：移除可能被 LLM 誤加的 CID 前綴 ──
+    if ":" in path:
+        prefix = path.split(":")[0].strip()
+        if prefix.isdigit() or prefix.lower() == "cid":
+            path = path.split(":", 1)[1].strip()
+
     # 1. 嘗試物理路徑讀取
     try:
-        # 嘗試原路徑、相對路徑、以及修剪前綴的路徑
         potential_paths = [path, os.path.abspath(path)]
+        
+        # 支援從環境變數讀取目標專案根目錄
+        target_dir = os.environ.get("TARGET_DIR", "")
+        if target_dir and not path.startswith(target_dir):
+            potential_paths.insert(0, os.path.join(target_dir, path))
+
         parts = path.split("/")
         if len(parts) > 1:
-            potential_paths.append("/".join(parts[1:])) # 移除前綴 e.g. paybnb-service/
+            potential_paths.append("/".join(parts[1:]))
             
         found_path = None
         for p in potential_paths:
@@ -90,11 +100,19 @@ def read_exact_file_tool(path: str, lines: str = None, hybrid_search=None) -> st
         if found_path:
             with open(found_path, "r", encoding="utf-8") as f:
                 content_lines = f.readlines()
-            if lines:
-                start, end = map(int, lines.split("-"))
+                
+            # 根據行號精確提取 (1-based index)
+            if line_start is not None and line_end is not None:
+                start = max(1, int(line_start))
+                end = min(len(content_lines), int(line_end))
                 selected = content_lines[start-1:end]
-                return "".join(selected)
-            return "".join(content_lines)
+                return f"[FILE: {path} | LINES: {start}-{end}]\n" + "".join(selected)
+            elif line_start is not None:
+                start = max(1, int(line_start))
+                selected = content_lines[start-1:]
+                return f"[FILE: {path} | LINES: {start}-END]\n" + "".join(selected)
+                
+            return f"[FILE: {path} | FULL CONTENT]\n" + "".join(content_lines)
             
     except Exception:
         pass # 轉向備援
@@ -104,15 +122,15 @@ def read_exact_file_tool(path: str, lines: str = None, hybrid_search=None) -> st
         try:
             from qdrant_client import models
             collection = hybrid_search.collection_name
-            file_name = os.path.basename(path)
             
+            # 使用 MatchValue 進行精確的完整路徑匹配，避免 MatchText 被 keyword 索引拒絕
             points, _ = hybrid_search.client.scroll(
                 collection_name=collection,
                 scroll_filter=models.Filter(
                     must=[
                         models.FieldCondition(
                             key="file_path",
-                            match=models.MatchText(text=file_name)
+                            match=models.MatchValue(value=path)
                         )
                     ]
                 ),
@@ -121,13 +139,7 @@ def read_exact_file_tool(path: str, lines: str = None, hybrid_search=None) -> st
             )
             
             if points:
-                # 篩選出最匹配的路徑 (應對同名檔案)
-                target_points = [p for p in points if p.payload.get("file_path") == path]
-                if not target_points:
-                    target_points = [p for p in points if str(p.payload.get("file_path")).endswith(path)]
-                if not target_points:
-                    target_points = points
-                
+                target_points = points
                 target_points.sort(key=lambda p: p.payload.get("chunk_index", 0))
                 
                 full_text = []
