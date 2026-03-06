@@ -51,12 +51,20 @@ class WorkerGraph:
         if rejected_ids:
             current_evidence = [c for c in current_evidence if c.id not in rejected_ids and not any(c.id.startswith(rid) for rid in rejected_ids)]
 
-        # ──【優化：精確狀態摘要】──
         local_summary = self._summarize_evidence(current_evidence, state.get("local_findings", ""))
         
-        full_evidence_context = local_summary
+        context_parts = []
+        if state.get("project_tree"):
+            context_parts.append(f"--- Global Project Directory Tree ---\n{state['project_tree']}")
         if state.get("starting_knowledge") and state["starting_knowledge"] != "No evidence collected yet.":
-            full_evidence_context = f"--- Shared Knowledge (From Peers) ---\n{state['starting_knowledge']}\n\n--- Your Current Progress ---\n{state.get('local_findings', 'Beginning investigation...')}\n\n--- Your Evidence Assets ---\n{local_summary}"
+            context_parts.append(f"--- Shared Knowledge (From Peers) ---\n{state['starting_knowledge']}")
+            
+        context_parts.append(f"--- Your Current Progress ---\n{state.get('local_findings', 'Beginning investigation...')}")
+        context_parts.append(f"--- Your Evidence Assets ---\n{local_summary}")
+        
+        full_evidence_context = "\n\n".join(context_parts)
+
+        tool_messages = state.get("tool_messages", [])
 
         out = self.planner.plan(
             query=state["query"],
@@ -65,19 +73,41 @@ class WorkerGraph:
             iteration=iteration,
             previous_missing=state.get("missing_evidence", []),
             sub_tasks=[state["task_description"]],
-            critic_feedback=state.get("critic_feedback", "")
+            critic_feedback=state.get("critic_feedback", ""),
+            tool_messages=tool_messages
         )
+        
+        if getattr(out, "tool_results", None):
+            for res in out.tool_results:
+                if res.get("type") == "assistant_msg":
+                    tool_messages.append(res["message"])
         
         return {
             "iteration": iteration,
             "planner_tool_calls": out.tool_calls,
             "local_evidence": current_evidence,
-            "should_stop": out.should_stop
+            "should_stop": out.should_stop,
+            "tool_messages": tool_messages
         }
 
     def _node_executor(self, state: WorkerState) -> Dict[str, Any]:
         tool_calls = state.get("planner_tool_calls", [])
+        tool_messages = state.get("tool_messages", [])
+        
         new_cards = self.execute_tools(tool_calls, state["iteration"], exclude_cids=state.get("exclude_cids"))
+        
+        if tool_calls:
+            for tc in tool_calls:
+                call_id = tc.get("id")
+                if call_id:
+                    snippets = [c.snippet for c in new_cards[:5]]
+                    content = "\n".join(snippets) if snippets else "Tool executed, but no direct textual snippet generated or matched."
+                    tool_messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": tc["tool"],
+                        "content": content[:2000]
+                    })
         
         current_evidence = state.get("local_evidence", [])
         existing_ids = {c.id for c in current_evidence}
@@ -87,44 +117,60 @@ class WorkerGraph:
                 
         return {
             "local_evidence": current_evidence,
-            "planner_tool_calls": []
+            "current_turn_evidence": new_cards, # 【新增】儲存本輪新抓到的證據
+            "planner_tool_calls": [],
+            "tool_messages": tool_messages
         }
 
     def _node_investigator(self, state: WorkerState) -> Dict[str, Any]:
         """
-        優化後的調查員：實施負向過濾與代碼引註。
+        員工自省節點：強制構建階層式調用鏈路。
+        【狀態分離優化】Investigator 僅分析當前輪次抓回來的新證據，避免陷入歷史垃圾的死循環。
         """
-        evidence = state.get("local_evidence", [])
-        if not evidence:
-            return {"local_findings": "No evidence assets to investigate."}
-
-        # 僅分析尚未在 findings 中被深度引用的、有內容的檔案
-        active_evidence = [c for c in evidence if len(c.chunk_text) > 100][-3:] # 每次分析 3 個新檔案
-        if not active_evidence:
+        new_evidence = state.get("current_turn_evidence", [])
+        if not new_evidence:
             return {"local_findings": state.get("local_findings", "No new code read yet.")}
+
+        # 僅過濾出本輪中帶有實際代碼內容的卡片
+        valid_evidence = [c for c in new_evidence if len(c.chunk_text) > 100]
+        
+        # 依據搜尋/圖譜擴展的分數降冪排序，確保最核心的代碼在最前面
+        valid_evidence.sort(key=lambda x: x.score_hybrid, reverse=True)
+        active_evidence = valid_evidence[:10] # 【修復：從 3 提高到 10，讓 Investigator 能看到完整的拓樸鏈路】
+        
+        if not active_evidence:
+            return {"local_findings": state.get("local_findings", "New evidence contains only paths, no content to analyze.")}
 
         evidence_dump = ""
         for i, c in enumerate(active_evidence):
-            evidence_dump += f"\n[DOC ID: {c.id[:8]} | PATH: {c.path}]\n{c.chunk_text[:3000]}\n"
+            # 限制單份檔案長度，避免 10 份檔案撐爆 Token
+            evidence_dump += f"\n[DOC ID: {c.id[:8]} | PATH: {c.path}]\n{c.chunk_text[:1500]}\n"
 
         prompt = f"""
         You are a Senior Engineer building a cumulative INVESTIGATION LOG.
         TASK: {state['task_description']}
         
-        --- PREVIOUS LOG ---
+        --- PREVIOUS LOG (Your Long-Term Memory) ---
         {state.get('local_findings', 'Empty.')}
 
-        --- NEW DOCUMENTS TO ANALYZE ---
+        --- NEW DOCUMENTS TO ANALYZE (Your Short-Term Focus) ---
         {evidence_dump}
 
         MISSION:
-        Update your log with FACTS found in the new documents.
+        Update your log with FACTS found in the NEW documents.
         1. **Precision**: Use "Hard Proof" (direct code quotes) for valid facts.
-        2. **Efficiency**: If a document is IRRELEVANT (wrong module, noise), simply record: "[REJECTED] {c.id[:8]} - Reason". Do NOT summarize junk.
-        3. **Evolution**: Correct any old notes if the new code provides better clarity.
+        2. **Hierarchical Flow**: You MUST document the execution flow using arrows and indentation to show the call chain.
+           Example:
+           [Endpoint] MemberDepositV2Controller.createDeposit()
+             └── [Validates] MemberCreateDepositRequest (DTO)
+                 └── [Constraint] @BrandCode String merchantCode
+             └── [Calls] MemberDepositV2Service.process()
+        3. **Efficiency**: If a document is IRRELEVANT, simply record: "[REJECTED] {{DOC_ID}} - Reason". Do NOT summarize junk.
+        4. **Evolution**: Correct old notes if the new code provides better clarity.
 
         FORMAT:
-        - **Verified Findings**: (Fact + Code Quote)
+        - **Execution Call Chain**: (Hierarchical flow as shown above)
+        - **Verified Facts**: (Additional facts + Code Quote)
         - **Rejected Paths**: (ID + Short Reason)
         - **Next Action**: (Specific target)
         """
@@ -132,7 +178,7 @@ class WorkerGraph:
         try:
             response = self.investigator_client.chat.completions.create(
                 model=self.inv_cfg.model,
-                messages=[{"role": "system", "content": "You are a surgical investigator. Only log high-signal facts with quotes."}, {"role": "user", "content": prompt}],
+                messages=[{"role": "system", "content": "You are a surgical investigator. Build hierarchical call chains."}, {"role": "user", "content": prompt}],
                 temperature=0.1
             )
             findings = response.choices[0].message.content
@@ -140,7 +186,7 @@ class WorkerGraph:
             return {"local_findings": findings}
         except Exception as e:
             logger.error(f"Investigator failed: {e}")
-            return {"local_findings": "Error updating investigation log."}
+            return {"local_findings": state.get("local_findings", "")}
 
     def _node_critic(self, state: WorkerState) -> Dict[str, Any]:
         structured_evidence = []
@@ -184,7 +230,6 @@ class WorkerGraph:
         lines = []
         for c in cards:
             cid_short = c.id[:8]
-            # 檢查檔案是否已在筆記中被分析過
             has_body = len(c.chunk_text) > 100
             if not has_body:
                 status = "MISSING (Need to call read_exact_file)"
@@ -196,7 +241,7 @@ class WorkerGraph:
             lines.append(f"- ID: {cid_short} | {c.path} | {status}")
         return "\n".join(lines)
 
-    def run(self, task_id: str, description: str, query: str, starting_knowledge: str = "", exclude_cids: List[int] = None) -> Dict[str, Any]:
+    def run(self, task_id: str, description: str, query: str, starting_knowledge: str = "", exclude_cids: List[int] = None, project_tree: str = "") -> Dict[str, Any]:
         initial_state = {
             "task_id": task_id,
             "task_description": description,
@@ -204,10 +249,13 @@ class WorkerGraph:
             "query": query,
             "iteration": 0,
             "search_history": [],
+            "tool_messages": [],
             "planner_tool_calls": [],
             "tool_results": [],
             "local_evidence": [],
+            "current_turn_evidence": [], # 【新增】
             "starting_knowledge": starting_knowledge,
+            "project_tree": project_tree,
             "exclude_cids": exclude_cids or [],
             "local_findings": "",
             "missing_evidence": [],

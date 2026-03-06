@@ -59,6 +59,7 @@ class PlannerOutput:
     rationale: str
     should_stop: bool
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    tool_results: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -155,10 +156,13 @@ class WorkerState(TypedDict):
     query: str
     iteration: int
     search_history: Annotated[List[str], operator.add]
+    tool_messages: Annotated[List[Dict[str, Any]], operator.add]
     planner_tool_calls: List[Dict[str, Any]]
     tool_results: List[Dict[str, Any]]
     local_evidence: List[EvidenceCard]
+    current_turn_evidence: List[EvidenceCard]  # 【新增】本回合最新抓取的證據
     starting_knowledge: str
+    project_tree: str
     exclude_cids: List[int]
     local_findings: str
     missing_evidence: List[MissingEvidence]
@@ -173,6 +177,7 @@ class GraphState(TypedDict):
     """LangGraph 共享狀態"""
     query: str
     module_map: str
+    project_tree: str                          # 【新增】全景地圖
     intent: str
     sub_tasks: List[SubTask]
     worker_reports: Annotated[List[str], operator.add]

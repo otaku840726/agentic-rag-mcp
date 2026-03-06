@@ -89,7 +89,7 @@ class AgenticSearch:
         self.graph_enhancer = graph_enhancer
         
         self.evidence_store = EvidenceStore()
-        self.analyst = Analyst()
+        self.analyst = Analyst(hybrid_search=self.hybrid_search) # 【傳入 hybrid_search】
         self.synthesizer = Synthesizer(self._build_llm_configs("synthesizer", SynthesizerConfig))
         self.budget = self._build_llm_configs("planner", PlannerConfig)
         
@@ -125,8 +125,15 @@ class AgenticSearch:
     def _node_analyst(self, state: GraphState) -> Dict[str, Any]:
         logger.info(f"--- [Node: Analyst] Decomposing query ---")
         full_query = state["query"]
+        context_parts = []
         if state.get("module_map"):
-            full_query = f"{state['query']}\n\n[CRITICAL System Module Map]:\n{state['module_map']}\n(Investigate EACH core module listed above!)"
+            context_parts.append(f"[CRITICAL System Module Map]:\n{state['module_map']}\n(Investigate EACH core module listed above!)")
+        if state.get("project_tree"):
+            context_parts.append(f"{state['project_tree']}")
+            
+        if context_parts:
+            full_query = f"{state['query']}\n\n" + "\n\n".join(context_parts)
+            
         out = self.analyst.analyze(full_query)
         sub_tasks = [SubTask(id=f"task_{i}", description=desc, assigned_domain="") for i, desc in enumerate(out.sub_tasks)]
         return {"intent": out.intent, "sub_tasks": sub_tasks}
@@ -157,7 +164,7 @@ class AgenticSearch:
                 unique_tasks.append(t)
                 seen_intents.add(intent_key)
         
-        final_tasks = unique_tasks[:2]
+        final_tasks = unique_tasks[:1] # 【優化：強制單一 Worker，專注主線】
         logger.info(f"Consolidated into {len(final_tasks)} key investigations.")
 
         starting_summary = self.evidence_store.get_summary_for_planner()
@@ -176,7 +183,7 @@ class AgenticSearch:
             
             if self.graph_enhancer and new_cards:
                 try:
-                    expanded_cards = self.graph_enhancer.expand_evidence(new_cards, top_k=8)
+                    expanded_cards = self.graph_enhancer.expand_evidence(new_cards, top_k=5)
                     if expanded_cards:
                         ecards = self._convert_to_evidence_cards(expanded_cards, {"tool":"graph_expansion"}, iteration)
                         new_cards.extend(ecards)
@@ -188,7 +195,15 @@ class AgenticSearch:
             futures = []
             for task in final_tasks:
                 worker = WorkerGraph(execute_tools_callback, self.budget)
-                futures.append(executor.submit(worker.run, task.id, task.description, state["query"], starting_knowledge=starting_summary, exclude_cids=global_exclude_cids))
+                futures.append(executor.submit(
+                    worker.run, 
+                    task.id, 
+                    task.description, 
+                    state["query"], 
+                    starting_knowledge=starting_summary,
+                    exclude_cids=global_exclude_cids,
+                    project_tree=state.get("project_tree", "")
+                ))
                 
             reports = []
             for future in concurrent.futures.as_completed(futures):
@@ -228,10 +243,16 @@ class AgenticSearch:
         for res in raw_results:
             text = res.get("content") or res.get("snippet") or ""
             fp = hashlib.md5(text.encode()).hexdigest()
+            
+            # 從 payload 中安全提取隱藏欄位
+            payload = res.get("payload", {})
+            symbol = res.get("symbol") or payload.get("symbol_name") or payload.get("name")
+            cid = res.get("community_id") or res.get("cid") or payload.get("community_id")
+            
             cards.append(EvidenceCard(
                 id=res.get("id") or str(uuid.uuid4()),
                 path=res.get("path") or "",
-                symbol=res.get("symbol"),
+                symbol=symbol,
                 snippet=text[:300],
                 chunk_text=text,
                 score_hybrid=res.get("score", 0.5),
@@ -239,7 +260,7 @@ class AgenticSearch:
                 round_found=round_idx,
                 source_kind=SourceKind.FILE if "path" in res else SourceKind.GRAPH,
                 fingerprint=fp,
-                community_id=res.get("community_id") or res.get("cid"),
+                community_id=cid,
                 named_entities=[]
             ))
         return cards
@@ -247,14 +268,25 @@ class AgenticSearch:
     def search(self, query: str) -> SearchResult:
         start_time = time.time()
         module_map = ""
+        project_tree = "" # 【新增：全景目錄樹】
         if self.graph_store:
             try:
+                # 獲取全景目錄樹
+                project_tree = self.graph_store.get_project_tree()
+                
                 stop_words = {"should", "what", "fill", "filled", "with", "api", "create"}
                 keywords = [kw.lower() for kw in re.findall(r'\w+', query) if kw.lower() not in stop_words and len(kw) > 3]
                 relevant_comms = []
                 for kw in keywords:
                     res = self.graph_store.cypher_query(
-                        "MATCH (c:Community {project: $project}) WHERE toLower(c.name) CONTAINS $kw RETURN c.id as id, c.name as name LIMIT 2",
+                        """
+                        MATCH (c:Community {project: $project}) 
+                        WHERE toLower(c.name) CONTAINS $kw 
+                        OPTIONAL MATCH (s:Symbol)-[:IN_COMMUNITY]->(c)
+                        RETURN c.id as id, c.name as name, count(s) as size
+                        ORDER BY size DESC
+                        LIMIT 2
+                        """,
                         {"kw": kw, "project": self.graph_store.default_project}
                     )
                     relevant_comms.extend(res)
@@ -265,7 +297,17 @@ class AgenticSearch:
             except Exception as e:
                 logger.warning(f"Pre-search failed: {e}")
 
-        initial_state: GraphState = {"query": query, "module_map": module_map, "intent": "", "sub_tasks": [], "worker_reports": [], "search_history": [], "rejected_ids": [], "final_response": None}
+        initial_state: GraphState = {
+            "query": query, 
+            "module_map": module_map,
+            "project_tree": project_tree, # 【新增】
+            "intent": "", 
+            "sub_tasks": [], 
+            "worker_reports": [], 
+            "search_history": [], 
+            "rejected_ids": [], 
+            "final_response": None
+        }
         try:
             final_state = self.graph.invoke(initial_state)
             elapsed = int((time.time() - start_time) * 1000)

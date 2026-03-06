@@ -9,44 +9,111 @@ from dataclasses import dataclass, asdict
 
 from .provider import create_client_for
 from .models import PlannerOutput, MissingEvidence, PlannerConfig
-from .utils import extract_json_from_response
 
 logger = logging.getLogger(__name__)
 
 PLANNER_PROMPT = """You are a Code Search Strategist. Your goal is to gather enough code evidence to fully answer the user's query.
-
-AVAILABLE TOOLS:
-1. `semantic_search`: Find initial entry points, APIs, or general concepts. 
-   - Arguments: {"query": "search terms", "cid": "optional_community_id"}
-2. `graph_list_files`: List files in a directory or community via Knowledge Graph. Use this to find specific controllers/DTOs when semantic search is too broad.
-   - Arguments: {"dir_path": "optional_path_snippet", "cid": "optional_cid", "pattern": "optional_name_pattern"}
-3. `graph_symbol_search`: Find callers/callees of a specific class or method. 
-   - Arguments: {"symbol": "ClassName"}
-4. `read_exact_file`: Read the full body of a file. 
-   - Arguments: {"path": "absolute/path/to/file.java"}
-5. `process_search`: Find existing execution flows. 
-   - Arguments: {"query": "keyword"}
 
 STRATEGIC RULES (EFFICIENCY FIRST):
 1. **The "Rule of Content"**: If a file path is in 'Current Evidence' with 'Status: MISSING', and the Critic points it out as relevant, your VERY NEXT action MUST be `read_exact_file`. Do NOT perform more semantic searches until the core files are read.
 2. **The "Graph Navigation"**: If `semantic_search` keeps hitting the wrong module, use `graph_list_files` with a `pattern` (e.g., "*Controller*") and a `cid` to see all relevant files in that community.
 3. **The "Search Defense"**: If the Critic has REJECTED a domain (e.g., 'Stop searching in CID 73 Promo'), you MUST acknowledge this. In your next `semantic_search`, explicitly focus on different CIDs or paths. 
 4. **No Redundancy**: Do not call the same tool with the same arguments if the previous result was empty or rejected.
+5. **Completion**: If you have enough evidence and no missing elements are reported by the Critic, simply do not call any tools. This signals that the investigation is complete.
 
-Please output your plan in the following JSON format:
-{
-    "tool_calls": [
-        {"tool": "tool_name", "args": {"arg_key": "arg_value"}}
-    ],
-    "rationale": "Execution Logic: (1) What files I am reading to fill gaps, (2) What rejected paths I am avoiding.",
-    "should_stop": false
-}
+Your tool calls will be executed by Workers. Provide a clear rationale explaining why you are calling these specific tools and what rejected paths you are avoiding.
 """
+
+TOOLS_DEF = [
+    {
+        "type": "function",
+        "function": {
+            "name": "semantic_search",
+            "description": "Find initial entry points, APIs, or general concepts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search terms"},
+                    "cid": {"type": "string", "description": "Optional Community ID to restrict the search"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "graph_list_files",
+            "description": "List files in a directory or community via Knowledge Graph. Use this to find specific controllers/DTOs when semantic search is too broad.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dir_path": {"type": "string", "description": "Optional path snippet"},
+                    "cid": {"type": "string", "description": "Optional Community ID"},
+                    "pattern": {"type": "string", "description": "Optional name pattern, e.g., '*Controller*'"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "graph_symbol_search",
+            "description": "Find callers/callees of a specific class or method.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "ClassName or MethodName"}
+                },
+                "required": ["symbol"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_exact_file",
+            "description": "Read the full body of a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute or relative path to the file. e.g., 'path/to/file.java'"}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "process_search",
+            "description": "Find existing execution flows.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Keyword to search for in process flows"}
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
 
 class Planner:
     def __init__(self, config=None):
         self.config = config or PlannerConfig()
         self.client, self.comp_cfg = create_client_for("planner")
+        
+        # Load global project context
+        self.project_context = ""
+        try:
+            import os
+            context_path = os.path.join(os.getcwd(), "PROJECT_CONTEXT.md")
+            if os.path.exists(context_path):
+                with open(context_path, "r", encoding="utf-8") as f:
+                    self.project_context = f.read()
+        except Exception as e:
+            logger.warning(f"Planner could not load PROJECT_CONTEXT: {e}")
 
     def plan(
         self,
@@ -57,7 +124,8 @@ class Planner:
         previous_missing: List[MissingEvidence] = None,
         sub_tasks: List[str] = None,
         tool_results: List[Dict[str, Any]] = None,
-        critic_feedback: str = ""
+        critic_feedback: str = "",
+        tool_messages: List[Dict[str, Any]] = None # 【新增：傳遞真實對話歷史】
     ) -> PlannerOutput:
         
         user_prompt = f"User Query: {query}\nIteration: {iteration}\n\nTarget Sub-tasks: {sub_tasks}\n\n"
@@ -71,37 +139,62 @@ class Planner:
             critic_notes = [m.need for m in previous_missing]
             user_prompt += f"Missing Elements to Find:\n{json.dumps(critic_notes, indent=2)}\n\n"
             
-        user_prompt += "What is your next tool call? Remember the Rule of Content and Search Defense."
+        user_prompt += "What is your next tool call? Provide your reasoning, then call the appropriate tools. If no further action is needed, do not call any tools."
+
+        system_prompt = PLANNER_PROMPT
+        if self.project_context:
+            system_prompt = f"--- GLOBAL PROJECT CONTEXT & NAVIGATION RULES ---\n{self.project_context}\n\n=======================================================\n\n{PLANNER_PROMPT}"
+
+        # 組合歷史訊息
+        messages = [{"role": "system", "content": system_prompt}]
+        if tool_messages:
+            messages.extend(tool_messages)
+        messages.append({"role": "user", "content": user_prompt})
 
         try:
             response = self.client.chat.completions.create(
                 model=self.comp_cfg.model,
-                messages=[
-                    {"role": "system", "content": PLANNER_PROMPT},
-                    {"role": "user", "content": user_prompt}
-                ],
+                messages=messages,
+                tools=TOOLS_DEF,
+                tool_choice="auto",
                 temperature=self.config.temperature
             )
             msg = response.choices[0].message
 
-            reasoning = getattr(msg, "reasoning", None)
+            reasoning = getattr(msg, "reasoning", msg.content or "")
             if reasoning:
                 logger.info(f"🤔 [Planner Reasoning]:\n{reasoning}")
 
-            content = msg.content or ""
-            print(f"\n[DEBUG - Planner Raw Content]\n{content}\n")
+            tool_calls = []
+            should_stop = True
+            raw_assistant_message = {"role": "assistant", "content": msg.content}
+            
+            if msg.tool_calls:
+                should_stop = False
+                raw_assistant_message["tool_calls"] = []
+                for tc in msg.tool_calls:
+                    try:
+                        args = json.loads(tc.function.arguments)
+                        tool_calls.append({"tool": tc.function.name, "args": args, "id": tc.id})
+                        raw_assistant_message["tool_calls"].append({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                        })
+                    except Exception as e:
+                        logger.warning(f"Failed to parse tool arguments for {tc.function.name}: {e}")
 
-            data = extract_json_from_response(content)
-
-            tool_calls = data.get("tool_calls") or data.get("plan") or data.get("tools") or []
+            # 將這回合的助手訊息包裝進 tool_results 中，以便 WorkerGraph 收集
+            tool_results_out = [{"type": "assistant_msg", "message": raw_assistant_message}]
 
             return PlannerOutput(
                 next_queries=[], 
                 missing_evidence=[],
                 evidence_found=[],
-                rationale=data.get("rationale", ""),
-                should_stop=data.get("should_stop", False),
-                tool_calls=tool_calls
+                rationale=reasoning,
+                should_stop=should_stop,
+                tool_calls=tool_calls,
+                tool_results=tool_results_out # 【新增回傳】
             )
         except Exception as e:
             logger.error(f"Planner failed: {e}")

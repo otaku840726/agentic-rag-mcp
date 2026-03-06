@@ -37,78 +37,107 @@ class GraphSearchEnhancer:
     def expand_evidence(
         self,
         evidence_cards: List["EvidenceCard"],
-        top_k: int = 15, # 增加擴展數量
+        top_k: int = 15,
     ) -> List[Dict[str, Any]]:
-        """利用物理鏈路與社群歸屬，自動拼湊完整業務鄰里。"""
+        """利用物理鏈路與名稱相似性，提供全方位的拓樸資訊。"""
         existing_paths = {card.path for card in evidence_cards}
         symbol_names = self._extract_symbols(evidence_cards)
-        
-        # 收集社群 ID
         target_communities = {c.community_id for c in evidence_cards if c.community_id is not None}
 
         if not symbol_names and not target_communities:
             return []
 
-        project = getattr(self.graph, "default_project", "default")
-        neighbor_files: Dict[str, float] = {}
+        project = getattr(self.graph, "default_project", "smilepay")
+        neighbor_files: Dict[str, Dict[str, Any]] = {}
 
-        # 1. [物理連通性擴展] 查詢 2-hop 內的調用者與被調用者
+        # 1. [物理連通性擴展] 查詢 1-2 hop 內的鄰居
         if symbol_names:
-            logger.info(f"Deterministic linkage expansion for {len(symbol_names)} symbols...")
+            logger.info(f"Topology expansion for symbols...")
             linkage_query = """
             MATCH (start:Symbol)
             WHERE (start.name IN $names OR start.fqn IN $names) AND start.project = $project
-            MATCH (start)-[:CALLS|USES_TYPE|IMPLEMENTS|INHERITS*1..2]-(neighbor:Symbol)
+            MATCH (start)-[r:CALLS|USES_TYPE|IMPLEMENTS|INHERITS*1..2]-(neighbor:Symbol)
             WHERE neighbor.file_path IS NOT NULL AND neighbor.project = $project
-            RETURN DISTINCT neighbor.file_path as path, COUNT(*) as weight
-            LIMIT 50
+            RETURN DISTINCT neighbor.file_path as path, neighbor.name as name, type(r[0]) as rel_type, start.name as source
+            LIMIT 30
             """
-            res = self.graph.cypher_query(linkage_query, {"names": symbol_names[:15], "project": project})
-            for r in res:
-                fp = r['path']
-                if fp not in existing_paths:
-                    neighbor_files[fp] = neighbor_files.get(fp, 0) + float(r['weight'])
+            try:
+                res = self.graph.cypher_query(linkage_query, {"names": symbol_names[:15], "project": project})
+                for r in res:
+                    fp = r['path']
+                    if fp and fp not in existing_paths:
+                        desc = f"[Topology] '{r['name']}' is related to '{r['source']}' via {r['rel_type']}"
+                        if fp not in neighbor_files:
+                            neighbor_files[fp] = {"weight": 2.0, "reason": desc, "cid": None}
+                        else:
+                            neighbor_files[fp]["weight"] += 1.0
+            except Exception as e:
+                logger.warning(f"Linkage query failed: {e}")
 
-        # 2. [社群歸屬擴展] 查詢同社群的核心成員 (這是抓取 Advice 的關鍵)
-        if target_communities:
-            logger.info(f"Deterministic community expansion for CIDs: {list(target_communities)}")
-            cid_list = [str(cid) for cid in target_communities] + list(target_communities)
-            community_query = """
-            MATCH (s:Symbol {project: $project})
-            WHERE s.communityId IN $cids OR EXISTS { (s)-[:IN_COMMUNITY]->(c:Community) WHERE c.id IN $cids }
-            RETURN DISTINCT s.file_path as path
-            LIMIT 50
-            """
-            res = self.graph.cypher_query(community_query, {"cids": cid_list, "project": project})
-            for r in res:
-                fp = r['path']
-                if fp and fp not in existing_paths:
-                    neighbor_files[fp] = neighbor_files.get(fp, 0) + 2.0 # 社群成員權重更高
+        # 2. [名稱相似性擴展] 尋找全專案中名稱相似但版本/社群不同的符號 (解決 V1 vs V2)
+        if symbol_names:
+            logger.info(f"Sibling version expansion for symbols...")
+            # 取 symbol 名稱的核心部分 (例如 MemberDepositV2Controller -> MemberDeposit)
+            core_names = []
+            import re
+            for name in symbol_names[:5]:
+                # 移除 V1, V2, Impl, Controller 等後綴
+                core = re.sub(r'V\d+', '', name)
+                core = core.replace('Controller', '').replace('Service', '').replace('Impl', '')
+                if len(core) > 5:
+                    core_names.append(core)
+                    
+            if core_names:
+                sibling_query = """
+                MATCH (s:Symbol {project: $project})
+                WHERE any(core IN $cores WHERE s.name CONTAINS core) 
+                  AND NOT s.name IN $names
+                  AND s.file_path IS NOT NULL
+                RETURN DISTINCT s.file_path as path, s.name as name, s.communityId as cid
+                LIMIT 20
+                """
+                try:
+                    res = self.graph.cypher_query(sibling_query, {
+                        "project": project, 
+                        "cores": core_names,
+                        "names": symbol_names
+                    })
+                    for r in res:
+                        fp = r['path']
+                        if fp and fp not in existing_paths:
+                            desc = f"[Similarity] '{r['name']}' shares core name pattern with current targets. (CID: {r.get('cid', 'Unknown')})"
+                            if fp not in neighbor_files:
+                                neighbor_files[fp] = {"weight": 1.5, "reason": desc, "cid": r.get('cid')}
+                except Exception as e:
+                    logger.warning(f"Sibling query failed: {e}")
 
         if not neighbor_files:
             return []
 
-        # Sort by weight and take top_k
-        sorted_files = sorted(neighbor_files.items(), key=lambda x: -x[1])
+        # 排序並取 Top K
+        sorted_files = sorted(neighbor_files.items(), key=lambda x: -x[1]["weight"])
 
-        # Fetch content from Qdrant
         supplementary = []
-        for file_path, _score in sorted_files[:top_k]:
+        for file_path, data in sorted_files[:top_k]:
             try:
                 results = self.search.search_by_file_path(file_path, limit=2)
                 for r in results:
+                    # 將拓樸原因注入到 snippet 或 content 頂部，讓 Worker 能直接看見
+                    reason_header = f"--- GRAPH TOPOLOGY CONTEXT ---\n{data['reason']}\n------------------------------\n"
+                    orig_content = r.get("content", "")
+                    
                     supplementary.append({
                         "path": r.get("path", file_path),
-                        "content": r.get("content", ""),
-                        "score": r.get("score", 0.0),
-                        "score_hybrid": 1.5, # 賦予高分確保進入工作集
+                        "content": reason_header + orig_content,
+                        "score": 1.5,
+                        "score_hybrid": 1.5,
                         "payload": r.get("payload", {}),
                         "source": "graph_expansion",
                     })
             except Exception as e:
                 logger.debug(f"Qdrant fetch failed for graph expansion {file_path}: {e}")
 
-        logger.info(f"Aggressive Graph expansion added {len(supplementary)} supplementary cards.")
+        logger.info(f"Graph expansion added {len(supplementary)} supplementary cards with topology context.")
         return supplementary
 
     def _extract_symbols(self, evidence_cards: List["EvidenceCard"]) -> List[str]:

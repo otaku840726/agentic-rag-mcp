@@ -93,6 +93,13 @@ class GraphStore:
             s.start_line = sym.start_line,
             s.end_line = sym.end_line,
             s.project = sym.project
+        
+        // 【新增：強制建立 File 節點與實體關聯】
+        WITH s, sym
+        WHERE sym.file_path IS NOT NULL AND sym.file_path <> ''
+        MERGE (f:File {path: sym.file_path, project: sym.project})
+        MERGE (s)-[:DEFINED_IN]->(f)
+        
         WITH s, sym
         CALL apoc.create.addLabels(s, [sym.label]) YIELD node
         RETURN count(node)
@@ -108,6 +115,13 @@ class GraphStore:
             s.start_line = sym.start_line,
             s.end_line = sym.end_line,
             s.project = sym.project
+            
+        // 【新增：強制建立 File 節點與實體關聯】
+        WITH s, sym
+        WHERE sym.file_path IS NOT NULL AND sym.file_path <> ''
+        MERGE (f:File {path: sym.file_path, project: sym.project})
+        MERGE (s)-[:DEFINED_IN]->(f)
+        
         RETURN count(s)
         """
 
@@ -761,6 +775,48 @@ class GraphStore:
                     "connections": record["connections"],
                 })
         return {"file": file_path, "dependencies": deps}
+
+    def get_project_tree(self, project: str = None) -> str:
+        """從圖譜中提取並構建專案的完整目錄樹"""
+        proj = project or self.default_project
+        query = """
+        MATCH (f:File {project: $project})
+        RETURN f.path as path
+        """
+        try:
+            with self.driver.session(database=self.database) as session:
+                results = session.run(query, project=proj)
+                paths = [r["path"] for r in results]
+                
+            if not paths:
+                return "No files found in graph."
+
+            # 構建樹狀結構
+            tree_dict = {}
+            for p in sorted(paths):
+                parts = p.split('/')
+                current = tree_dict
+                for part in parts:
+                    current = current.setdefault(part, {})
+
+            # 轉換為格式化字串
+            def render_tree(d, prefix=""):
+                lines = []
+                entries = list(d.keys())
+                for i, key in enumerate(entries):
+                    is_last = i == len(entries) - 1
+                    connector = "└── " if is_last else "├── "
+                    lines.append(f"{prefix}{connector}{key}")
+                    if d[key]: # 如果有子目錄
+                        extension = "    " if is_last else "│   "
+                        lines.extend(render_tree(d[key], prefix + extension))
+                return lines
+
+            tree_str = "\n".join(render_tree(tree_dict))
+            return f"[Project Directory Structure]\n{tree_str}"
+        except Exception as e:
+            logger.error(f"Failed to fetch project tree: {e}")
+            return "Project tree unavailable."
 
     def cypher_query(self, query: str, params: Optional[Dict] = None) -> List[Dict]:
         """Execute raw Cypher query (for advanced MCP tool).
