@@ -20,12 +20,15 @@ YOUR AVAILABLE ACTIONS (Tools):
 RULES OF INVESTIGATION:
 - If your manager tells you to find a Call Chain, you must use `read_exact_file` and `graph_symbol_search` to trace the flow.
 - **NEVER OUTPUT PLAIN TEXT ANSWERS**: You are not answering the user directly. You are communicating with your Manager. If you find the answer, you MUST use the `report_to_manager` tool to submit your findings. Do not just type the answer in the chat.
-- **CRITICAL ERROR HANDLING**: If `read_exact_file` or `semantic_search` returns an error (like "File not found") or empty results:
-  1. Do NOT try the exact same path/query again.
-  2. Do NOT start randomly searching the root directory `/`.
-  3. Instead, IMMEDIATELY call `report_to_manager` with `has_blocker=true` and tell the Manager what failed so they can give you a new path.
+- **CRITICAL ERROR HANDLING**: If `read_exact_file` or `semantic_search` returns an error (like "File not found") or empty results `[]`:
+  1. If you used a `cid` to restrict the search, try the search again with an EMPTY `cid` to perform a global search.
+  2. Do NOT try the exact same path/query again without changing parameters.
+  3. Do NOT start randomly searching the root directory `/` or making up fake paths.
+  4. If all else fails, IMMEDIATELY call `report_to_manager` with `has_blocker=true` and tell the Manager what failed so they can give you a new direction.
 - **PARTIAL FINDINGS (Time Management)**: If you have called tools many times and traced deep into the code, but haven't found the *complete* answer yet, you can call `report_to_manager` with your **Partial Findings** and `has_blocker=false` or `true` (depending on if you are stuck). It is better to report partial progress than to search endlessly.
-- **SURGICAL READING**: When reading a large file (like a Controller or Service), DO NOT invent a 'search' or 'grep' tool. You ONLY have the 5 tools listed above. If you need to find a specific method, FIRST use `graph_symbol_search` with the Class name to get a list of its methods and their `start_line`/`end_line`, THEN use `read_exact_file` with the `path`, `line_start`, and `line_end` parameters to read only that method.
+- **SURGICAL READING**: When reading a large file (like a Controller or Service), DO NOT invent a 'search' or 'grep' tool. You ONLY have the 5 tools listed above. If you need to find a specific method, FIRST use `list_file_symbols` with the exact file path to get a clean list of its methods and their `line_start`/`line_end`, THEN use `read_exact_file` with the `path`, `line_start`, and `line_end` parameters to read only that method.
+- **COPY-PASTE MANDATE**: When using tools that require a `file_path` (like `list_file_symbols` or `read_exact_file`), you MUST copy the exact string from the `file_path` field returned by your search tools. DO NOT abbreviate it or guess it.
+- **ENCAPSULATION AWARENESS**: In modern frameworks, specific fields (like `merchantCode`) are often encapsulated inside Request objects (DTOs). If you surgically read a method (e.g. a Controller endpoint) and don't see the exact field name, DO NOT panic and DO NOT read the entire file. Simply report back that the method accepts a specific DTO object, and suggest the Manager to investigate that DTO or the downstream Service.
 """
 
 WORKER_TOOLS = [
@@ -43,6 +46,20 @@ WORKER_TOOLS = [
             "name": "graph_list_files",
             "description": "List files in a CID or path.",
             "parameters": {"type": "object", "properties": {"dir_path": {"type": "string"}, "cid": {"type": "string"}}, "required": []}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_file_symbols",
+            "description": "Get a clean list of all methods inside a File, including their line_start and line_end.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "The exact, full file_path string returned by search tools. DO NOT abbreviate."}
+                },
+                "required": ["file_path"]
+            }
         }
     },
     {
@@ -135,7 +152,7 @@ class WorkerAgent:
         
         # --- [DEBUG] 印出 Worker 的內心獨白 ---
         if msg.content:
-            print(f"\n🧠 [Worker] Thinking: {msg.content}")
+            logger.info(f"\n🧠 [Worker] Thinking: {msg.content}")
 
         if msg.tool_calls:
             assistant_msg["tool_calls"] = []
@@ -157,7 +174,7 @@ class WorkerAgent:
                     args = {}
                 
                 # 防呆：如果 LLM 發明了不存在的工具
-                valid_tools = ["semantic_search", "graph_list_files", "read_exact_file", "graph_symbol_search", "report_to_manager"]
+                valid_tools = ["semantic_search", "graph_list_files", "read_exact_file", "graph_symbol_search", "list_class_methods", "report_to_manager"]
                 if tool_name not in valid_tools:
                     logger.warning(f"👷 [Worker] Hallucinated tool '{tool_name}'. Forcing report_to_manager.")
                     new_log_entry = f"Task: {state['current_task']}\nFindings:\nWorker became stuck trying to invent non-existent tools (like '{tool_name}'). Please rephrase the task or provide a more specific instruction."
@@ -169,7 +186,7 @@ class WorkerAgent:
                 
                 if tool_name == "report_to_manager":
                     logger.info(f"👷 [Worker] Reporting back to Manager. Blocker: {args.get('has_blocker', False)}")
-                    print(f"📝 [Worker] Report to Manager: {args.get('findings', '')[:300]}...")
+                    logger.info(f"📝 [Worker] Report to Manager: {args.get('findings', '')[:300]}...")
                     
                     # 只回傳這回合新增的 log 字串，因為 state.py 中 investigation_log 定義為 Annotated[List[str], operator.add]
                     new_log_entry = f"Task: {state['current_task']}\nFindings:\n{args.get('findings', '')}"
@@ -185,7 +202,7 @@ class WorkerAgent:
                     
                     # --- [DEBUG] 印出 Worker 看到的工具回傳內容 ---
                     str_result = str(tool_result)
-                    print(f"📥 [Worker] Tool '{tool_name}' returned: {str_result[:500]}...")
+                    logger.info(f"📥 [Worker] Tool '{tool_name}' returned: {str_result[:500]}...")
                     
                     new_messages.append({
                         "role": "tool",
