@@ -9,6 +9,9 @@ class AgenticState(TypedDict):
     query: str                       # 使用者原始問題
     project_context: str             # 專案地圖 (PROJECT_CONTEXT.md)
     
+    # --- Analyst 的狀態 ---
+    intent_analysis: str             # Analyst 產出的意圖推演與任務拆解報告
+    
     # --- Manager 的狀態 ---
     manager_thoughts: Annotated[List[str], operator.add]     # Manager 的戰略思考筆記 (供自己參考)
     investigation_log: Annotated[List[str], operator.add]    # 所有 Worker 歷次提交的正式報告

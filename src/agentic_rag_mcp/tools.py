@@ -5,6 +5,12 @@ from typing import Dict, Any, List
 def semantic_search_tool(query: str, hybrid_search, query_builder, reranker, top_k: int = 20, cid: str = None, exclude_cids: List[int] = None) -> List[Dict[str, Any]]:
     from .models import QueryIntent
 
+    # ──【資料淨化】防呆機制：忽略 LLM 捏造的空集合 CID ──
+    if cid is not None:
+        cid_str = str(cid).strip().lower()
+        if cid_str in ["0", "", "none", "root", "null"]:
+            cid = None
+
     intent = QueryIntent(query=query, purpose="", query_type="semantic", operator="hybrid")
     queries = query_builder.build_from_intent(intent)
 
@@ -47,6 +53,13 @@ def graph_list_files_tool(graph_store, dir_path: str = None, cid: str = None, pa
     """利用 Neo4j 進行結構化檔案導航"""
     if not graph_store:
         return []
+        
+    # ──【資料淨化】防呆機制：忽略 LLM 捏造的空集合 CID ──
+    if cid is not None:
+        cid_str = str(cid).strip().lower()
+        if cid_str in ["0", "", "none", "root", "null"]:
+            cid = None
+            
     try:
         project = getattr(graph_store, "default_project", "smilepay")
         
@@ -165,3 +178,67 @@ def list_directory_tool(path: str, max_items: int = 50) -> List[str]:
         return result
     except Exception as e:
         return [f"Error listing directory: {e}"]
+
+def list_file_symbols_tool(file_path: str, graph_store) -> List[Dict[str, Any]]:
+    """
+    輸入一個檔案路徑 (file_path)，回傳該檔案內所有宣告的 Methods, Classes 的精確行號。
+    """
+    if not graph_store:
+        return [{"error": "Graph store not connected."}]
+    try:
+        project = getattr(graph_store, "default_project", "smilepay")
+        
+        # 尋找該檔案底下的所有 Symbol (排除無用的 local 變數)
+        cypher = """
+        MATCH (s:Symbol)-[:DEFINED_IN]->(f:File {path: $file_path})
+        WHERE s.project = $project AND s.kind IN ['method', 'class', 'interface', 'constructor']
+        RETURN s.name as symbol_name, s.kind as kind, s.start_line as start_line, s.end_line as end_line
+        ORDER BY s.start_line ASC
+        """
+        results = graph_store.cypher_query(cypher, {"project": project, "file_path": file_path})
+        
+        if not results:
+            return [{"error": f"No symbols (methods/classes) found in file '{file_path}'. Verify the exact path string."}]
+            
+        clean_list = []
+        for r in results:
+            clean_list.append({
+                "kind": r["kind"],
+                "name": r["symbol_name"],
+                "line_start": r["start_line"],
+                "line_end": r["end_line"]
+            })
+        return clean_list
+    except Exception as e:
+        return [{"error": str(e)}]
+
+def community_search_tool(query: str, graph_store) -> List[Dict[str, Any]]:
+    if not graph_store:
+        return [{"error": "Graph store not connected."}]
+    try:
+        project = getattr(graph_store, "default_project", "smilepay")
+        cypher = """
+        MATCH (c:Community {project: $project})
+        WHERE toLower(c.name) CONTAINS toLower($keyword) OR $keyword = ''
+        OPTIONAL MATCH (s:Symbol)-[:IN_COMMUNITY]->(c)
+        RETURN c.id as cid, c.name as name, count(s) as size
+        ORDER BY size DESC
+        LIMIT 6
+        """
+        # 【修正】將參數名稱改為 keyword，避免與底層函式的 query 撞名
+        results = graph_store.cypher_query(cypher, {"project": project, "keyword": query})
+        
+        if not results:
+            # 如果用名字查不到，就給前幾個最大的
+            fallback = """
+            MATCH (c:Community {project: $project})
+            OPTIONAL MATCH (s:Symbol)-[:IN_COMMUNITY]->(c)
+            RETURN c.id as cid, c.name as name, count(s) as size
+            ORDER BY size DESC
+            LIMIT 6
+            """
+            results = graph_store.cypher_query(fallback, {"project": project})
+            
+        return results
+    except Exception as e:
+        return [{"error": str(e)}]

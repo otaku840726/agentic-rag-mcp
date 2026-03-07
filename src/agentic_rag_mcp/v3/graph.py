@@ -10,7 +10,9 @@ from src.agentic_rag_mcp.tools import (
     semantic_search_tool, 
     graph_symbol_search_tool, 
     read_exact_file_tool,
-    graph_list_files_tool
+    graph_list_files_tool,
+    community_search_tool,
+    list_file_symbols_tool
 )
 
 logger = logging.getLogger(__name__)
@@ -30,6 +32,7 @@ class V3AgenticSearch:
     def _execute_tool(self, tool_name: str, args: Dict[str, Any]) -> Any:
         try:
             if tool_name == "semantic_search":
+                # 【修改】將 top_k 改回 5，避免過多雜訊導致 LLM 產生幻覺或混亂
                 raw_res = semantic_search_tool(args.get("query", ""), self.hybrid_search, self.query_builder, self.reranker, top_k=5, cid=args.get("cid"))
                 clean_res = []
                 for r in raw_res:
@@ -55,6 +58,8 @@ class V3AgenticSearch:
                 return clean_res
             elif tool_name == "graph_symbol_search":
                 return graph_symbol_search_tool(args.get("symbol", ""), self.graph_store)
+            elif tool_name == "list_file_symbols":
+                return list_file_symbols_tool(args.get("file_path", ""), self.graph_store)
             elif tool_name == "graph_list_files":
                 return graph_list_files_tool(self.graph_store, dir_path=args.get("dir_path"), cid=args.get("cid"), pattern=args.get("pattern"))
             elif tool_name == "read_exact_file":
@@ -64,6 +69,8 @@ class V3AgenticSearch:
                     line_end=args.get("line_end"),
                     hybrid_search=self.hybrid_search
                 )
+            elif tool_name == "community_search":
+                return community_search_tool(query=args.get("query", ""), graph_store=self.graph_store)
         except Exception as e:
             return f"Tool Execution Error: {str(e)}"
         return "Unknown Tool."
