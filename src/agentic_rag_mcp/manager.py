@@ -2,7 +2,7 @@ import json
 import logging
 from typing import Dict, Any
 
-from src.agentic_rag_mcp.provider import create_client_for
+from .provider import create_client_for
 from .state import AgenticState
 
 logger = logging.getLogger(__name__)

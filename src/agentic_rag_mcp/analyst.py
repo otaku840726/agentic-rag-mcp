@@ -1,107 +1,49 @@
-"""
-Analyst LLM - Decomposes user query into investigation sub-tasks.
-"""
-
-import json
 import logging
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
+from typing import Dict, Any
 
 from .provider import create_client_for
-from .models import AnalystOutput
-from .utils import extract_json_from_response
+from .state import AgenticState
 
 logger = logging.getLogger(__name__)
 
-ANALYST_SYSTEM_PROMPT = """You are a Lead Software Architect. Your task is to decompose a user query into highly effective search tasks.
+ANALYST_PROMPT = """You are a Senior System Analyst and the first line of defense in our engineering team.
+Your ONLY job is to deeply understand the User's Query and translate it into a comprehensive "Intent Analysis & Investigation Plan" for the Manager.
 
-PROJECT CONTEXT:
-You are analyzing a large codebase. Use the provided [System Module Map] if available to prioritize specific Community IDs (CIDs).
+YOU DO NOT HAVE TOOLS to search the code. You only have your brain and the Global Project Context.
 
-YOUR GOAL:
-Identify the core entities, their interactions, and the missing segments in your current knowledge.
+YOUR OBJECTIVES:
+1. **Empathy & Intent Deduction**: Why is the user asking this? Are they a frontend dev trying to integrate an API? Are they debugging an error?
+2. **Contextual Expansion**: What "extra" information would be extremely helpful to them? (e.g. if they ask for a field name, they probably also want to know the validation rules, where to get the field value, and what HTTP errors might occur).
+3. **Execution Plan**: Break down the investigation into 3-4 distinct logical steps (e.g. 1. Find the Controller, 2. Trace the DTO validation, 3. Check the Database interaction).
 
-STRATEGY:
-1. **Task Type Identification (Crucial)**:
-   - For **"Pinpoint Tracking"** questions (e.g., "What does field X mean?", "Where is API Y defined?"): Generate exactly ONE (1) consolidated investigation task. Combine all relevant CIDs into this single task's scope so a single Elite Worker can trace the logic deeply without parallel interference.
-   - For **"Broad Discovery"** questions (e.g., "How does the entire architecture work?"): You may generate multiple parallel tasks to explore different domains.
-2. **Deduplication**: Never assign multiple workers to search for the same entity in different folders.
-3. **Precision**: Target specific CIDs mentioned in the [System Module Map].
-
-OUTPUT FORMAT (Strict JSON):
-{
-    "subject": "The main entity being discussed",
-    "actors": ["List of services/roles involved"],
-    "covered": ["What is already known"],
-    "gaps": ["What we still need to find"],
-    "sub_tasks": [
-        "investigate: 'component interaction' across CID [X, Y, Z]"
-    ],
-    "reasoning": "Brief technical logic for this plan, explicitly stating if this is Pinpoint Tracking or Broad Discovery.",
-    "intent": "Search/Repair/Audit"
-}
+OUTPUT FORMAT (Plain Text):
+Write a structured, highly professional analysis document. The Manager will read this and use it to direct the Workers.
 """
 
-class Analyst:
-    def __init__(self, config=None, hybrid_search=None):
+class AnalystAgent:
+    def __init__(self):
+        # 使用 reasoning 模型來確保最高品質的意圖推演
         self.client, self.comp_cfg = create_client_for("analyst")
-        self.model = self.comp_cfg.model
-        self.temperature = 0.0
-        
-        # 嘗試讀取全域專案上下文
-        self.project_context = ""
-        try:
-            import os
-            context_path = os.path.join(os.getcwd(), "PROJECT_CONTEXT.md")
-            if os.path.exists(context_path):
-                with open(context_path, "r", encoding="utf-8") as f:
-                    self.project_context = f.read()
-                    logger.info("Loaded PROJECT_CONTEXT.md from local file successfully.")
-            elif hybrid_search and hasattr(hybrid_search, "client"):
-                import uuid
-                system_doc_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, "system.project_context"))
-                res = hybrid_search.client.retrieve(
-                    collection_name=hybrid_search.collection_name,
-                    ids=[system_doc_id]
-                )
-                if res:
-                    self.project_context = res[0].payload.get("content", "")
-                    logger.info("Loaded PROJECT_CONTEXT from Qdrant successfully.")
-        except Exception as e:
-            logger.warning(f"Could not load PROJECT_CONTEXT: {e}")
 
-    def analyze(self, query: str) -> AnalystOutput:
+    def act(self, state: AgenticState) -> Dict[str, Any]:
+        logger.info("🧠 [Analyst] Deeply analyzing the user's intent and formulating a plan...")
+        
+        system_prompt = f"--- GLOBAL PROJECT CONTEXT ---\n{state.get('project_context', 'No context provided.')}\n\n====================\n{ANALYST_PROMPT}"
+        user_content = f"USER QUERY: {state['query']}\n\nPlease provide your Intent Analysis & Investigation Plan."
+
         try:
-            system_prompt = ANALYST_SYSTEM_PROMPT
-            if self.project_context:
-                system_prompt = f"--- GLOBAL PROJECT CONTEXT & RULES ---\n{self.project_context}\n\n===================\n\n{ANALYST_SYSTEM_PROMPT}"
-                
             response = self.client.chat.completions.create(
-                model=self.model,
+                model=self.comp_cfg.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Decompose this query: {query}"}
+                    {"role": "user", "content": user_content}
                 ],
-                temperature=self.temperature
+                temperature=0.3
             )
-            msg = response.choices[0].message
-            content = msg.content or ""
+            analysis = response.choices[0].message.content
+            logger.info(f"💡 [Analyst] Completed Analysis:\n{analysis[:500]}...")
             
-            reasoning = getattr(msg, "reasoning", None)
-            if reasoning:
-                logger.info(f"🤔 [Analyst Reasoning]:\n{reasoning}")
-
-            data = extract_json_from_response(content)
-
-            return AnalystOutput(
-                subject=data.get("subject", ""),
-                actors=data.get("actors", []),
-                covered=data.get("covered", []),
-                gaps=data.get("gaps", []),
-                sub_tasks=data.get("sub_tasks", []),
-                reasoning=data.get("reasoning", ""),
-                intent=data.get("intent", "Search")
-            )
+            return {"intent_analysis": analysis}
         except Exception as e:
             logger.error(f"Analyst failed: {e}")
-            return AnalystOutput("error", [], [], [], [f"fallback search: {query}"], str(e))
+            return {"intent_analysis": "Analyst failed to produce a plan. Manager, please proceed with your best judgement."}

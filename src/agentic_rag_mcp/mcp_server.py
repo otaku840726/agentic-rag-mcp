@@ -67,7 +67,7 @@ except ImportError:
     MCP_AVAILABLE = False
     print("Warning: MCP not installed. Run: pip install mcp")
 
-from .agentic_search import AgenticSearch, AgenticSearchConfig
+from .agentic_search import AgenticSearch
 from .models import SearchResult
 from .provider import get_neo4j_config
 
@@ -114,8 +114,8 @@ def get_graph_store():
                 uri=cfg["uri"],
                 username=cfg["username"],
                 password=cfg["password"],
-                database=cfg["database"],
-                project=os.getenv("GRAPH_PROJECT", "default"),
+                database=cfg.get("database", "neo4j"),
+                project=os.getenv("GRAPH_PROJECT", "smilepay"),
             )
         except Exception as e:
             logger.warning(f"Failed to create graph store: {e}")
@@ -137,7 +137,24 @@ def get_search_agent() -> AgenticSearch:
     """獲取或創建搜索代理（單例）"""
     global search_agent
     if search_agent is None:
-        search_agent = AgenticSearch()
+        from .hybrid_search import HybridSearch
+        from .query_builder import QueryBuilder
+        from .reranker import Reranker, RerankerConfig
+        from .provider import get_component_config
+        
+        hybrid_search = HybridSearch()
+        query_builder = QueryBuilder()
+        r_base = get_component_config("reranker")
+        r_config = RerankerConfig(provider=r_base.provider, model_name=r_base.model)
+        reranker = Reranker(config=r_config)
+        
+        graph_store = get_graph_store()
+        
+        class DummyEnhancer:
+            def __init__(self, g):
+                self.graph = g
+                
+        search_agent = AgenticSearch(hybrid_search, query_builder, reranker, DummyEnhancer(graph_store))
     return search_agent
 
 
@@ -517,31 +534,22 @@ if MCP_AVAILABLE:
 
         if name == "agentic-search":
             query = arguments.get("query", "")
-            max_iter = arguments.get("max_iterations", 5)
-            llm_provider = arguments.get("llm_provider")
-            llm_model = arguments.get("llm_model")
+            
+            # 讀取專案地圖做為上下文
+            project_context = ""
+            import os
+            context_path = os.path.join(os.getcwd(), "PROJECT_CONTEXT.md")
+            if os.path.exists(context_path):
+                with open(context_path, "r", encoding="utf-8") as f:
+                    project_context = f.read()
 
-            if llm_provider or llm_model:
-                # 有 override：建立臨時 agent，不影響 singleton
-                tmp_config = AgenticSearch._load_default_config()
-                tmp_config.max_iterations = max_iter
-                agent = AgenticSearch(
-                    config=tmp_config,
-                    llm_provider=llm_provider,
-                    llm_model=llm_model,
-                )
-                logger.info(f"agentic-search override: provider={llm_provider} model={llm_model}")
-            else:
-                agent = get_search_agent()
-                agent.config.max_iterations = max_iter
-
-            # 執行搜索
-            result = agent.search(query)
-
-            # 格式化回應
-            text = format_response(result)
-
-            return [TextContent(type="text", text=text)]
+            agent = get_search_agent()
+            
+            # 執行 V1 全新架構搜索
+            final_answer = agent.search(query, project_context)
+            
+            # 格式化回應給 MCP Client
+            return [TextContent(type="text", text=final_answer)]
 
         elif name == "quick-search":
             query = arguments.get("query", "")

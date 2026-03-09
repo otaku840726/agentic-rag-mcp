@@ -1,317 +1,124 @@
-"""
-Agentic Search - 主循環控制
-協調 Analyst, SubTaskDelegator (Map-Reduce), WorkerGraph, Synthesizer
-"""
-
-import os
 import time
 import logging
-import uuid
-import json
-import re
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass, field
-from pathlib import Path
-
+from typing import Dict, Any, List
 from langgraph.graph import StateGraph, END
 
-from .models import (
-    GraphState, 
-    EvidenceCard, 
-    SynthesizedResponse, 
-    SearchResult,
-    AgenticSearchConfig,
-    SynthesizerConfig,
-    PlannerConfig,
-    SubTask,
-    SourceKind
-)
-from .provider import get_component_config, create_client_for, get_neo4j_config
-from .analyst import Analyst
-from .synthesizer import Synthesizer
-from .evidence_store import EvidenceStore
-from .search_logger import SearchTraceLogger
+from .state import AgenticState
+from .manager import ManagerAgent
+from .worker import WorkerAgent
+from .analyst import AnalystAgent
 from .tools import (
     semantic_search_tool, 
     graph_symbol_search_tool, 
     read_exact_file_tool,
-    graph_list_files_tool
+    graph_list_files_tool,
+    community_search_tool,
+    list_file_symbols_tool
 )
 
 logger = logging.getLogger(__name__)
 
 class AgenticSearch:
-    def __init__(self, hybrid_search=None, query_builder=None, reranker=None, graph_enhancer=None, config: Optional[AgenticSearchConfig] = None):
-        self.logger = logger
-        self.search_logger = SearchTraceLogger()
-        self.config = config or AgenticSearchConfig()
-        
-        if hybrid_search is None:
-            from .hybrid_search import HybridSearch
-            hybrid_search = HybridSearch()
-        if query_builder is None:
-            from .query_builder import QueryBuilder
-            query_builder = QueryBuilder()
-        if reranker is None:
-            # ──【修復：從配置讀取 Reranker】──
-            from .reranker import Reranker, RerankerConfig
-            r_base = get_component_config("reranker")
-            r_config = RerankerConfig(
-                provider=r_base.provider,
-                model_name=r_base.model
-            )
-            reranker = Reranker(config=r_config)
-            
-        self.graph_store = None
-        try:
-            from .indexer.graph_store import GraphStore
-            n_cfg = get_neo4j_config()
-            self.graph_store = GraphStore(
-                uri=n_cfg["uri"],
-                username=n_cfg["username"],
-                password=n_cfg["password"],
-                database=n_cfg.get("database", "neo4j"),
-                project=os.getenv("GRAPH_PROJECT", "smilepay")
-            )
-        except Exception as ge:
-            logger.warning(f"GraphStore initialization failed: {ge}")
-
-        if graph_enhancer is None:
-            from .graph_search import GraphSearchEnhancer
-            if self.graph_store:
-                graph_enhancer = GraphSearchEnhancer(self.graph_store, hybrid_search)
-            else:
-                graph_enhancer = None
-
+    def __init__(self, hybrid_search, query_builder, reranker, graph_enhancer=None, config=None):
         self.hybrid_search = hybrid_search
         self.query_builder = query_builder
         self.reranker = reranker
-        self.graph_enhancer = graph_enhancer
+        self.graph_store = graph_enhancer.graph if graph_enhancer else None
         
-        self.evidence_store = EvidenceStore()
-        self.analyst = Analyst(hybrid_search=self.hybrid_search) # 【傳入 hybrid_search】
-        self.synthesizer = Synthesizer(self._build_llm_configs("synthesizer", SynthesizerConfig))
-        self.budget = self._build_llm_configs("planner", PlannerConfig)
+        self.manager = ManagerAgent(self._execute_tool)
+        self.worker = WorkerAgent(self._execute_tool)
         
         self.graph = self._build_graph()
 
-    def _build_llm_configs(self, component: str, config_cls):
-        base = get_component_config(component)
-        if config_cls.__name__ == "PlannerConfig":
-            return config_cls(max_iterations=self.config.max_iterations, temperature=base.temperature)
-        return config_cls(
-            provider=base.provider,
-            model=base.model,
-            max_tokens=base.max_tokens,
-            temperature=base.temperature
-        )
+    def _execute_tool(self, tool_name: str, args: Dict[str, Any]) -> Any:
+        try:
+            if tool_name == "semantic_search":
+                # 【修改】將 top_k 改回 5，避免過多雜訊導致 LLM 產生幻覺或混亂
+                raw_res = semantic_search_tool(args.get("query", ""), self.hybrid_search, self.query_builder, self.reranker, top_k=5, cid=args.get("cid"))
+                clean_res = []
+                for r in raw_res:
+                    if isinstance(r, dict):
+                        file_path = r.get("file_path") or r.get("payload", {}).get("file_path", "")
+                        cid_val = r.get("community_id") or r.get("payload", {}).get("community_id", "Unknown")
+                        content = r.get("content") or r.get("payload", {}).get("content", "")
+                        if not content:
+                            content = r.get("content_preview") or r.get("payload", {}).get("content_preview", "")
+                    else:
+                        payload = getattr(r, "payload", {})
+                        file_path = getattr(r, "file_path", payload.get("file_path", ""))
+                        cid_val = getattr(r, "community_id", payload.get("community_id", "Unknown"))
+                        content = getattr(r, "content", payload.get("content", ""))
+                        if not content:
+                            content = getattr(r, "content_preview", payload.get("content_preview", ""))
+                            
+                    clean_res.append({
+                        "file_path": file_path,
+                        "community_id": cid_val,
+                        "snippet": str(content)[:800]
+                    })
+                return clean_res
+            elif tool_name == "graph_symbol_search":
+                return graph_symbol_search_tool(args.get("symbol", ""), self.graph_store)
+            elif tool_name == "list_file_symbols":
+                return list_file_symbols_tool(args.get("file_path", ""), self.graph_store)
+            elif tool_name == "graph_list_files":
+                return graph_list_files_tool(self.graph_store, dir_path=args.get("dir_path"), cid=args.get("cid"), pattern=args.get("pattern"))
+            elif tool_name == "read_exact_file":
+                return read_exact_file_tool(
+                    path=args.get("path", ""),
+                    line_start=args.get("line_start"),
+                    line_end=args.get("line_end"),
+                    hybrid_search=self.hybrid_search
+                )
+            elif tool_name == "community_search":
+                return community_search_tool(query=args.get("query", ""), graph_store=self.graph_store)
+        except Exception as e:
+            return f"Tool Execution Error: {str(e)}"
+        return "Unknown Tool."
 
     def _build_graph(self):
-        builder = StateGraph(GraphState)
-        builder.add_node("context_awareness", self._node_context_awareness)
-        builder.add_node("analyst", self._node_analyst)
-        builder.add_node("sub_task_delegator", self._node_sub_task_delegator)
-        builder.add_node("synthesizer", self._node_synthesizer)
-        builder.set_entry_point("context_awareness")
-        builder.add_edge("context_awareness", "analyst")
-        builder.add_edge("analyst", "sub_task_delegator")
-        builder.add_edge("sub_task_delegator", "synthesizer")
-        builder.add_edge("synthesizer", END)
+        builder = StateGraph(AgenticState)
+        
+        builder.add_node("manager", self.manager.act)
+        builder.add_node("worker", self.worker.act)
+        
+        builder.set_entry_point("manager")
+        
+        # 路由邏輯
+        def route_manager(state: AgenticState) -> str:
+            if state.get("is_finished"):
+                return END
+            if state.get("current_task"):
+                return "worker"
+            # 如果 Manager 只是在做 Scouting，沒有派發新任務，則繼續留在 Manager
+            return "manager"
+            
+        def route_worker(state: AgenticState) -> str:
+            if not state.get("current_task"):
+                # Worker 交卷了 (或放棄了)
+                return "manager"
+            return "worker" # 繼續執行自己發起的連續 Tool Call
+            
+        builder.add_conditional_edges("manager", route_manager, {"worker": "worker", "manager": "manager", END: END})
+        builder.add_conditional_edges("worker", route_worker, {"manager": "manager", "worker": "worker"})
+        
         return builder.compile()
 
-    def _node_context_awareness(self, state: GraphState) -> Dict[str, Any]:
-        return {}
-
-    def _node_analyst(self, state: GraphState) -> Dict[str, Any]:
-        logger.info(f"--- [Node: Analyst] Decomposing query ---")
-        full_query = state["query"]
-        context_parts = []
-        if state.get("module_map"):
-            context_parts.append(f"[CRITICAL System Module Map]:\n{state['module_map']}\n(Investigate EACH core module listed above!)")
-        if state.get("project_tree"):
-            context_parts.append(f"{state['project_tree']}")
-            
-        if context_parts:
-            full_query = f"{state['query']}\n\n" + "\n\n".join(context_parts)
-            
-        out = self.analyst.analyze(full_query)
-        sub_tasks = [SubTask(id=f"task_{i}", description=desc, assigned_domain="") for i, desc in enumerate(out.sub_tasks)]
-        return {"intent": out.intent, "sub_tasks": sub_tasks}
-
-    def _execute_tool(self, tool_name: str, args: Dict[str, Any], exclude_cids: List[int] = None) -> List[Dict[str, Any]]:
-        if tool_name == "semantic_search":
-            return semantic_search_tool(args.get("query", ""), self.hybrid_search, self.query_builder, self.reranker, top_k=self.config.top_n_search, cid=args.get("cid"), exclude_cids=exclude_cids)
-        elif tool_name == "graph_symbol_search":
-            return [{"path": "graph_search", "content": str(graph_symbol_search_tool(args.get("symbol", ""), self.graph_store, args.get("depth", 1)))}]
-        elif tool_name == "graph_list_files":
-            res = graph_list_files_tool(self.graph_store, dir_path=args.get("dir_path"), cid=args.get("cid"), pattern=args.get("pattern"))
-            return [{"path": "graph_ls", "content": json.dumps(res, indent=2)}]
-        elif tool_name == "read_exact_file":
-            # ──【優化：傳入 hybrid_search 實例以支持 Qdrant 備援讀取】──
-            return [{"path": args.get("path", ""), "content": read_exact_file_tool(args.get("path", ""), args.get("lines"), hybrid_search=self.hybrid_search)}]
-        return []
-
-    def _node_sub_task_delegator(self, state: GraphState) -> Dict[str, Any]:
-        logger.info(f"--- [Node: Delegator] Dispatching workers ---")
-        from .worker.worker_graph import WorkerGraph
-        import concurrent.futures
-        
-        unique_tasks = []
-        seen_intents = set()
-        for t in state['sub_tasks']:
-            intent_key = "".join(sorted(t.description.lower().split()))[:30]
-            if intent_key not in seen_intents:
-                unique_tasks.append(t)
-                seen_intents.add(intent_key)
-        
-        final_tasks = unique_tasks[:1] # 【優化：強制單一 Worker，專注主線】
-        logger.info(f"Consolidated into {len(final_tasks)} key investigations.")
-
-        starting_summary = self.evidence_store.get_summary_for_planner()
-        global_exclude_cids = []
-
-        def execute_tools_callback(tool_calls, iteration, exclude_cids=None):
-            new_cards = []
-            for tc in tool_calls:
-                try:
-                    logger.info(f"Worker executing Tool: {tc['tool']} with args: {tc['args']}")
-                    raw_result = self._execute_tool(tc["tool"], tc["args"], exclude_cids=exclude_cids)
-                    cards = self._convert_to_evidence_cards(raw_result, tc, iteration)
-                    new_cards.extend(cards)
-                except Exception as e:
-                    logger.error(f"Worker tool execution failed ({tc['tool']}): {e}")
-            
-            if self.graph_enhancer and new_cards:
-                try:
-                    expanded_cards = self.graph_enhancer.expand_evidence(new_cards, top_k=5)
-                    if expanded_cards:
-                        ecards = self._convert_to_evidence_cards(expanded_cards, {"tool":"graph_expansion"}, iteration)
-                        new_cards.extend(ecards)
-                except Exception as e:
-                    logger.warning(f"Graph expansion in worker failed: {e}")
-            return new_cards
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            futures = []
-            for task in final_tasks:
-                worker = WorkerGraph(execute_tools_callback, self.budget)
-                futures.append(executor.submit(
-                    worker.run, 
-                    task.id, 
-                    task.description, 
-                    state["query"], 
-                    starting_knowledge=starting_summary,
-                    exclude_cids=global_exclude_cids,
-                    project_tree=state.get("project_tree", "")
-                ))
-                
-            reports = []
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    worker_state = future.result()
-                    reports.append(worker_state.get("final_report", "No report."))
-                    if "local_evidence" in worker_state:
-                        self.evidence_store.add(worker_state["local_evidence"])
-                except Exception as e:
-                    logger.error(f"Worker execution failed: {e}")
-                    
-        return {"worker_reports": reports}
-
-    def _node_synthesizer(self, state: GraphState) -> Dict[str, Any]:
-        logger.info(f"--- [Node: Synthesizer] Aggregating worker reports ---")
-        all_valid_cards = [c for c in self.evidence_store.get_all_cards() if c.id not in state.get("rejected_ids", [])]
-        all_valid_cards.sort(key=lambda c: c.score_rerank, reverse=True)
-        
-        reports = state.get("worker_reports", [])
-        worker_context = "\n### Worker Reports Context:\n"
-        for i, r in enumerate(reports):
-            summary = r[:1500] + "..." if len(r) > 1500 else r
-            worker_context += f"\n-- Report {i+1} --\n{summary}\n"
-
-        response = self.synthesizer.synthesize(
-            query=f"{state['query']}\n\n{worker_context}",
-            evidence_cards=all_valid_cards[:25],
-            search_history=state.get("search_history", []),
-            iterations=1,
-            logger=self.search_logger
-        )
-        return {"final_response": response}
-
-    def _convert_to_evidence_cards(self, raw_results, tool_call, round_idx) -> List[EvidenceCard]:
-        cards = []
-        import hashlib
-        for res in raw_results:
-            text = res.get("content") or res.get("snippet") or ""
-            fp = hashlib.md5(text.encode()).hexdigest()
-            
-            # 從 payload 中安全提取隱藏欄位
-            payload = res.get("payload", {})
-            symbol = res.get("symbol") or payload.get("symbol_name") or payload.get("name")
-            cid = res.get("community_id") or res.get("cid") or payload.get("community_id")
-            
-            cards.append(EvidenceCard(
-                id=res.get("id") or str(uuid.uuid4()),
-                path=res.get("path") or "",
-                symbol=symbol,
-                snippet=text[:300],
-                chunk_text=text,
-                score_hybrid=res.get("score", 0.5),
-                score_rerank=res.get("score_rerank", 0.5),
-                round_found=round_idx,
-                source_kind=SourceKind.FILE if "path" in res else SourceKind.GRAPH,
-                fingerprint=fp,
-                community_id=cid,
-                named_entities=[]
-            ))
-        return cards
-
-    def search(self, query: str) -> SearchResult:
-        start_time = time.time()
-        module_map = ""
-        project_tree = "" # 【新增：全景目錄樹】
-        if self.graph_store:
-            try:
-                # 獲取全景目錄樹
-                project_tree = self.graph_store.get_project_tree()
-                
-                stop_words = {"should", "what", "fill", "filled", "with", "api", "create"}
-                keywords = [kw.lower() for kw in re.findall(r'\w+', query) if kw.lower() not in stop_words and len(kw) > 3]
-                relevant_comms = []
-                for kw in keywords:
-                    res = self.graph_store.cypher_query(
-                        """
-                        MATCH (c:Community {project: $project}) 
-                        WHERE toLower(c.name) CONTAINS $kw 
-                        OPTIONAL MATCH (s:Symbol)-[:IN_COMMUNITY]->(c)
-                        RETURN c.id as id, c.name as name, count(s) as size
-                        ORDER BY size DESC
-                        LIMIT 2
-                        """,
-                        {"kw": kw, "project": self.graph_store.default_project}
-                    )
-                    relevant_comms.extend(res)
-                if relevant_comms:
-                    unique_comms = {str(c['id']): c['name'] for c in relevant_comms}
-                    module_map = "Highly relevant modules found in graph:\n" + "\n".join([f"- CID {cid}: {name}" for cid, name in unique_comms.items()])
-                    logger.info(f"Pre-search guidance generated:\n{module_map}")
-            except Exception as e:
-                logger.warning(f"Pre-search failed: {e}")
-
-        initial_state: GraphState = {
-            "query": query, 
-            "module_map": module_map,
-            "project_tree": project_tree, # 【新增】
-            "intent": "", 
-            "sub_tasks": [], 
-            "worker_reports": [], 
-            "search_history": [], 
-            "rejected_ids": [], 
-            "final_response": None
+    def search(self, query: str, project_context: str) -> str:
+        initial_state = {
+            "query": query,
+            "project_context": project_context,
+            "manager_thoughts": [],
+            "investigation_log": [],
+            "current_task": "",
+            "target_cids": [],
+            "current_worker_messages": [],
+            "final_answer": "",
+            "is_finished": False
         }
-        try:
-            final_state = self.graph.invoke(initial_state)
-            elapsed = int((time.time() - start_time) * 1000)
-            return SearchResult(success=True, response=final_state.get("final_response"), debug_info={"time_ms": elapsed})
-        except Exception as e:
-            logger.error(f"Search failed: {e}", exc_info=True)
-            return SearchResult(success=False, error=str(e))
+        
+        # 設定執行次數上限，防止無限打乒乓球
+        config = {"recursion_limit": 100}
+        
+        final_state = self.graph.invoke(initial_state, config=config)
+        return final_state.get("final_answer", "Investigation timed out without a final answer.")

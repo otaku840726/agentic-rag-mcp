@@ -111,7 +111,16 @@ class AnalyzerFactory:
             _csharp_src = str(Path(__file__).parent.parent / "analyzers" / "csharp")
             return DockerAnalyzer(image=image, command_template=command,
                                   extra_volumes=extra_volumes, source_dir=_csharp_src)
-        
+
+        elif analyzer_type == AnalyzerType.PHP_PARSER:
+            # Use Docker analyzer with PHP-Parser image (nikic/PHP-Parser)
+            from .docker_analyzer import DockerAnalyzer
+            image = os.getenv("ANALYZER_PHP_IMAGE", "agentic-rag-php-analyzer:latest")
+            command = os.getenv("ANALYZER_PHP_COMMAND", "{file_path}")
+            _php_src = str(Path(__file__).parent.parent / "analyzers" / "php")
+            return DockerAnalyzer(image=image, command_template=command,
+                                  source_dir=_php_src)
+
         else:
             # Fallback to tree-sitter
             logger.warning(f"Unknown analyzer type {analyzer_type}, falling back to tree-sitter")

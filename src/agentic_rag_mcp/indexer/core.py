@@ -131,6 +131,9 @@ EXT_CATEGORY_MAP = {
     ".cpp":        ("source-code", "cpp"),          # OCR / DeCaptcha
     ".cc":         ("source-code", "cpp"),
 
+    # ── PHP ──
+    ".php":        ("source-code", "php"),          # Laravel / generic PHP
+
     # ── Web / Style ──
     ".css":        ("source-code", "css"),
     ".html":       ("documentation", None),
@@ -924,6 +927,7 @@ class IndexerService:
             _analyzers_root = Path(__file__).parent.parent / "analyzers"
             _csharp_analyzer_hash = self._dir_hash(_analyzers_root / "csharp")
             _java_analyzer_hash   = self._dir_hash(_analyzers_root / "java")
+            _php_analyzer_hash    = self._dir_hash(_analyzers_root / "php")
 
             for sln_path in sln_files:
                 sln_dir = str(Path(sln_path).parent)
@@ -952,6 +956,26 @@ class IndexerService:
                 })
                 if graph_hashes.get(pom_path) != agg:
                     solutions_changed.add(pom_path)
+
+            # PHP: use composer.json as the project anchor (like .sln for C#)
+            # Each .php file is analyzed individually by PHP-Parser, but we group
+            # by composer.json for change detection (re-analyze when any .php changes)
+            composer_files = [p for p in current_files if p.endswith("composer.json")]
+            for composer_path in composer_files:
+                composer_dir = str(Path(composer_path).parent)
+                constituent = {
+                    p: h for p, h in current_files.items()
+                    if p.startswith(composer_dir) and p.lower().endswith(".php")
+                    and not Path(p).name.endswith(".blade.php")   # blade = view layer, skip
+                }
+                if not constituent:
+                    continue
+                agg = self._aggregate_hash({
+                    **constituent,
+                    "__php_analyzer__": _php_analyzer_hash,
+                })
+                if graph_hashes.get(composer_path) != agg:
+                    solutions_changed.add(composer_path)
 
             graph_deleted = set(graph_hashes) - set(current_files)
 
@@ -1157,6 +1181,8 @@ class IndexerService:
                         "symbol_name": sym.get("name"),
                         "symbol_type": sym.get("node_type"),
                         "category": EXT_CATEGORY_MAP.get(ext, ("other", None))[0],
+                        "language": result.language or EXT_CATEGORY_MAP.get(ext, ("other", None))[1] or "",
+                        "service": rel_path.split("/")[0] if "/" in rel_path else "",
                         "file_hash": file_hash,
                     }
                     for k, v in sym.items():
@@ -1188,7 +1214,7 @@ class IndexerService:
         current_files: Dict[str, str],
         dir_path: Path,
     ) -> Dict[str, Any]:
-        """Pipeline B: re-analyze changed solutions with Roslyn/Spoon → AuraDB."""
+        """Pipeline B: re-analyze changed solutions with Roslyn/Spoon/PHP-Parser → AuraDB."""
         from .project_detector import AnalyzerType
         import tempfile
 
@@ -1201,6 +1227,76 @@ class IndexerService:
                 abs_sln = dir_path / sln_rel_path
             if not abs_sln.exists():
                 continue
+
+            # ── PHP: composer.json anchor → analyze each .php file individually ──
+            if abs_sln.name == "composer.json":
+                composer_dir = str(Path(sln_rel_path).parent)
+                php_files = sorted(
+                    p for p in current_files
+                    if p.startswith(composer_dir) and p.lower().endswith(".php")
+                    and not Path(p).name.endswith(".blade.php")
+                )
+                if not php_files:
+                    continue
+
+                try:
+                    from .project_detector import ProjectDetector
+                    detector = ProjectDetector(dir_path)
+                    detector_type = detector.detect_project_type(
+                        dir_path / composer_dir if composer_dir else dir_path
+                    )
+                    php_analyzer_type = detector.get_analyzer_for_file(
+                        Path(php_files[0]), detector_type
+                    )
+                    # Only proceed if PHP-Parser Docker is available
+                    if not detector.is_analyzer_available(php_analyzer_type,
+                                                          "agentic-rag-php-analyzer:latest"):
+                        logger.warning(
+                            f"PHP-Parser Docker unavailable for {composer_dir}, "
+                            "skipping Neo4j graph (Qdrant tree-sitter indexing still runs)"
+                        )
+                        continue
+
+                    php_analyzer = AnalyzerFactory.create_auto("", php_analyzer_type)
+                    php_processed = 0
+                    for php_rel_path in php_files:
+                        abs_php = dir_path / php_rel_path
+                        if not abs_php.exists():
+                            abs_php = self.base_dir / php_rel_path
+                        if not abs_php.exists():
+                            continue
+                        try:
+                            result = php_analyzer.analyze(str(abs_php))
+                            self._ingest_analysis_to_graph(
+                                result, php_rel_path,
+                                current_files.get(php_rel_path, "")
+                            )
+                            php_processed += 1
+                        except Exception as e:
+                            logger.error(f"PHP-Parser error for {php_rel_path}: {e}")
+                            errors.append({"file": php_rel_path, "error": str(e)})
+
+                    # Store aggregate hash on the composer.json File node so we
+                    # can detect changes next run (reuse upsert_file_node for hash)
+                    php_dir = composer_dir or "."
+                    constituent = {p: h for p, h in current_files.items()
+                                   if p.startswith(php_dir) and p.endswith(".php")}
+                    agg_hash = self._aggregate_hash(constituent)
+                    self.graph_store.upsert_file_node(
+                        sln_rel_path,
+                        {"service": composer_dir.split("/")[0] if "/" in composer_dir else composer_dir,
+                         "layer": "", "category": "configuration", "language": "json"},
+                        project=self.graph_store.default_project,
+                        hash=agg_hash,
+                    )
+                    logger.info(f"PHP-Parser: {php_processed} files indexed for {composer_dir}")
+                    processed += php_processed
+
+                except Exception as e:
+                    logger.error(f"PHP pipeline error for {sln_rel_path}: {e}")
+                    errors.append({"solution": sln_rel_path, "error": str(e)})
+                continue
+            # ── END PHP handling ──────────────────────────────────────────────
 
             ext = Path(sln_rel_path).suffix.lower()
             is_java = abs_sln.name in ("pom.xml",) or ext in (".gradle",)

@@ -58,6 +58,8 @@ _GRAMMAR_MAP: Dict[str, tuple] = {
     ".bash":       ("tree_sitter_bash",        "language"),
     # ── XML-derived ──
     ".xaml":       ("tree_sitter_xml",         "language_xml"),  # MAUI/WPF UI
+    # ── PHP ──
+    ".php":        ("tree_sitter_php",         "language_php"),  # Laravel / generic PHP
 }
 
 # Extensions that use the HTML parser via parse_html_template (three-layer strategy).
@@ -200,7 +202,11 @@ class TreeSitterAnalyzer(BaseAnalyzer):
         _ensure_ts()
         chunks: List[ASTChunk] = []
 
-        if ext == '.cs':
+        # Blade templates (.blade.php) are HTML + PHP mixed — route to HTML template parser
+        # Must check before ext == '.php' since os.path.splitext gives '.php' for both
+        if os.path.basename(file_path).endswith('.blade.php'):
+            chunks = parse_html_template(content, file_path)
+        elif ext == '.cs':
             chunks = parse_csharp(content, file_path)
         elif ext == '.java':
             chunks = parse_java(content, file_path)
@@ -300,9 +306,13 @@ class TreeSitterAnalyzer(BaseAnalyzer):
             type_ref_rels = _extract_type_references(tree_root, namespace, type_decl_types, member_types, ext)
             relationships.extend(type_ref_rels)
 
+        # Blade templates get language="blade" (not "php") for cleaner filtering
+        lang = "blade" if os.path.basename(file_path).endswith('.blade.php') else (
+            ext[1:] if ext.startswith('.') else ext
+        )
         return AnalysisResult(
             file_path=file_path,
-            language=ext[1:] if ext.startswith('.') else ext,
+            language=lang,
             symbols=symbols,
             relationships=relationships,
             raw_ast=None  # Tree-sitter AST is too verbose to dump raw
@@ -380,6 +390,10 @@ _GENERIC_SPLIT_TYPES: Dict[str, set] = {
     # Shell
     ".sh":    {"function_definition", "compound_statement"},
     ".bash":  {"function_definition", "compound_statement"},
+    # PHP — classes/interfaces/traits are direct children of program root
+    # (PHP namespace_definition is just a declaration, not a block container)
+    ".php":   {"class_declaration", "interface_declaration", "trait_declaration",
+               "function_definition"},
 }
 
 # Name extraction: for each split type, which child field/type holds the name

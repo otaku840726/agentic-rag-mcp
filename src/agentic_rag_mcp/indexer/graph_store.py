@@ -19,6 +19,7 @@ EDGE_TYPES = {
     "calls",        # method calls method
     "uses_type",    # property/param type reference
     "defined_in",   # symbol defined in file
+    "trait_use",    # PHP: class uses trait
 }
 
 
@@ -92,14 +93,18 @@ class GraphStore:
             s.namespace = sym.namespace,
             s.start_line = sym.start_line,
             s.end_line = sym.end_line,
-            s.project = sym.project
-        
+            s.project = sym.project,
+            // PHP optional fields — null-safe: only set when present, never overwrite with null
+            s.visibility  = CASE WHEN sym.visibility  IS NOT NULL THEN sym.visibility  ELSE s.visibility  END,
+            s.is_static   = CASE WHEN sym.is_static   IS NOT NULL THEN sym.is_static   ELSE s.is_static   END,
+            s.is_abstract = CASE WHEN sym.is_abstract IS NOT NULL THEN sym.is_abstract ELSE s.is_abstract END
+
         // 【新增：強制建立 File 節點與實體關聯】
         WITH s, sym
         WHERE sym.file_path IS NOT NULL AND sym.file_path <> ''
         MERGE (f:File {path: sym.file_path, project: sym.project})
         MERGE (s)-[:DEFINED_IN]->(f)
-        
+
         WITH s, sym
         CALL apoc.create.addLabels(s, [sym.label]) YIELD node
         RETURN count(node)
@@ -114,14 +119,18 @@ class GraphStore:
             s.namespace = sym.namespace,
             s.start_line = sym.start_line,
             s.end_line = sym.end_line,
-            s.project = sym.project
-            
+            s.project = sym.project,
+            // PHP optional fields — null-safe: only set when present, never overwrite with null
+            s.visibility  = CASE WHEN sym.visibility  IS NOT NULL THEN sym.visibility  ELSE s.visibility  END,
+            s.is_static   = CASE WHEN sym.is_static   IS NOT NULL THEN sym.is_static   ELSE s.is_static   END,
+            s.is_abstract = CASE WHEN sym.is_abstract IS NOT NULL THEN sym.is_abstract ELSE s.is_abstract END
+
         // 【新增：強制建立 File 節點與實體關聯】
         WITH s, sym
         WHERE sym.file_path IS NOT NULL AND sym.file_path <> ''
         MERGE (f:File {path: sym.file_path, project: sym.project})
         MERGE (s)-[:DEFINED_IN]->(f)
-        
+
         RETURN count(s)
         """
 
@@ -135,6 +144,9 @@ class GraphStore:
             "constructor": "Constructor",
             "property": "Property",
             "record": "Record",
+            # PHP-specific kinds
+            "trait": "Trait",
+            "function": "Function",   # PHP global function (not a method)
         }
         # Enrich each sym dict with project and label
         for sym in symbols:
@@ -181,6 +193,8 @@ class GraphStore:
             "PUBLISHES_TO", "SUBSCRIBES_TO",
             # Annotation usage: class/method/field → annotation type
             "ANNOTATED_BY",
+            # PHP trait usage: class uses trait
+            "TRAIT_USE",
         }
 
         # Group by relationship type

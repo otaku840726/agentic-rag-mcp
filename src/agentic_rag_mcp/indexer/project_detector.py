@@ -20,15 +20,18 @@ class ProjectType(Enum):
     NODEJS = "nodejs"
     PYTHON = "python"
     GO = "go"
+    PHP_LARAVEL = "php_laravel"   # Laravel / Laravel Modules
+    PHP_GENERIC = "php_generic"   # Any composer-based PHP project
     MIXED = "mixed"
     UNKNOWN = "unknown"
 
 
 class AnalyzerType(Enum):
     """Available analyzer types."""
-    SPOON = "spoon"           # Java via Docker
-    ROSLYN = "roslyn"         # C# via Docker
-    TREE_SITTER = "tree-sitter"  # Fallback for all languages
+    SPOON = "spoon"               # Java via Docker
+    ROSLYN = "roslyn"             # C# via Docker
+    PHP_PARSER = "php-parser"     # PHP via Docker (nikic/PHP-Parser)
+    TREE_SITTER = "tree-sitter"   # Fallback for all languages
 
 
 # Project type detection markers
@@ -62,7 +65,18 @@ PROJECT_MARKERS = {
         "files": ["go.mod", "go.sum"],
         "dirs": [],
         "patterns": []
-    }
+    },
+    ProjectType.PHP_LARAVEL: {
+        # Laravel full app has artisan; Laravel Modules (nwidart) have composer.json + Http/
+        "files": ["composer.json"],
+        "dirs": ["Http"],
+        "patterns": []
+    },
+    ProjectType.PHP_GENERIC: {
+        "files": ["composer.json"],
+        "dirs": [],
+        "patterns": ["**/*.php"]
+    },
 }
 
 
@@ -86,6 +100,12 @@ EXTENSION_ANALYZER_MAP = {
     ".vb": {
         ProjectType.DOTNET: AnalyzerType.ROSLYN,
         "default": AnalyzerType.TREE_SITTER
+    },
+    # PHP
+    ".php": {
+        ProjectType.PHP_LARAVEL: AnalyzerType.PHP_PARSER,
+        ProjectType.PHP_GENERIC: AnalyzerType.PHP_PARSER,
+        "default":               AnalyzerType.TREE_SITTER,  # fallback if Docker unavailable
     },
     # All others default to tree-sitter
     ".js": {"default": AnalyzerType.TREE_SITTER},

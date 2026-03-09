@@ -1,0 +1,14 @@
+{
+    "name": "agentic-rag/php-analyzer",
+    "description": "PHP AST analyzer using nikic/PHP-Parser for agentic-rag-mcp",
+    "require": {
+        "php": ">=8.0",
+        "nikic/php-parser": "^5.0"
+    },
+    "autoload": {
+        "psr-4": {}
+    },
+    "config": {
+        "optimize-autoloader": true
+    }
+}
