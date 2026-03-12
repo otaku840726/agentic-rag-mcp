@@ -56,6 +56,9 @@ dependencies = [
     "langchain-core>=1.2.16",
     "voyageai>=0.3.7",
     "pytest>=9.0.2",
+    "tree-sitter-php>=0.24.1",
+    "tree-sitter-c>=0.23.0",
+    "tree-sitter-cpp>=0.23.0",
 ]
 
 [project.optional-dependencies]

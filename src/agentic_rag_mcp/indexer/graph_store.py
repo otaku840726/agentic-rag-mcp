@@ -95,9 +95,23 @@ class GraphStore:
             s.end_line = sym.end_line,
             s.project = sym.project,
             // PHP optional fields — null-safe: only set when present, never overwrite with null
-            s.visibility  = CASE WHEN sym.visibility  IS NOT NULL THEN sym.visibility  ELSE s.visibility  END,
-            s.is_static   = CASE WHEN sym.is_static   IS NOT NULL THEN sym.is_static   ELSE s.is_static   END,
-            s.is_abstract = CASE WHEN sym.is_abstract IS NOT NULL THEN sym.is_abstract ELSE s.is_abstract END
+            s.visibility       = CASE WHEN sym.visibility       IS NOT NULL THEN sym.visibility       ELSE s.visibility       END,
+            s.is_static        = CASE WHEN sym.is_static        IS NOT NULL THEN sym.is_static        ELSE s.is_static        END,
+            s.is_abstract      = CASE WHEN sym.is_abstract      IS NOT NULL THEN sym.is_abstract      ELSE s.is_abstract      END,
+            s.is_deprecated    = CASE WHEN sym.is_deprecated    IS NOT NULL THEN sym.is_deprecated    ELSE s.is_deprecated    END,
+            s.is_test          = CASE WHEN sym.is_test          IS NOT NULL THEN sym.is_test          ELSE s.is_test          END,
+            s.language         = CASE WHEN sym.language         IS NOT NULL THEN sym.language         ELSE s.language         END,
+            s.service          = CASE WHEN sym.service          IS NOT NULL THEN sym.service          ELSE s.service          END,
+            s.file_type        = CASE WHEN sym.file_type        IS NOT NULL THEN sym.file_type        ELSE s.file_type        END,
+            s.entry_point_type = CASE WHEN sym.entry_point_type IS NOT NULL THEN sym.entry_point_type ELSE s.entry_point_type END,
+            s.http_method      = CASE WHEN sym.http_method      IS NOT NULL THEN sym.http_method      ELSE s.http_method      END,
+            s.http_path        = CASE WHEN sym.http_path        IS NOT NULL THEN sym.http_path        ELSE s.http_path        END,
+            s.auth_required    = CASE WHEN sym.auth_required    IS NOT NULL THEN sym.auth_required    ELSE s.auth_required    END,
+            s.auth_roles       = CASE WHEN sym.auth_roles       IS NOT NULL THEN sym.auth_roles       ELSE s.auth_roles       END,
+            s.table_name       = CASE WHEN sym.table_name       IS NOT NULL THEN sym.table_name       ELSE s.table_name       END,
+            s.operation_type   = CASE WHEN sym.operation_type   IS NOT NULL THEN sym.operation_type   ELSE s.operation_type   END,
+            s.makes_http_call  = CASE WHEN sym.makes_http_call  IS NOT NULL THEN sym.makes_http_call  ELSE s.makes_http_call  END,
+            s.annotations_json = CASE WHEN sym.annotations_json IS NOT NULL THEN sym.annotations_json ELSE s.annotations_json END
 
         // 【新增：強制建立 File 節點與實體關聯】
         WITH s, sym
@@ -120,10 +134,23 @@ class GraphStore:
             s.start_line = sym.start_line,
             s.end_line = sym.end_line,
             s.project = sym.project,
-            // PHP optional fields — null-safe: only set when present, never overwrite with null
-            s.visibility  = CASE WHEN sym.visibility  IS NOT NULL THEN sym.visibility  ELSE s.visibility  END,
-            s.is_static   = CASE WHEN sym.is_static   IS NOT NULL THEN sym.is_static   ELSE s.is_static   END,
-            s.is_abstract = CASE WHEN sym.is_abstract IS NOT NULL THEN sym.is_abstract ELSE s.is_abstract END
+            s.visibility       = CASE WHEN sym.visibility       IS NOT NULL THEN sym.visibility       ELSE s.visibility       END,
+            s.is_static        = CASE WHEN sym.is_static        IS NOT NULL THEN sym.is_static        ELSE s.is_static        END,
+            s.is_abstract      = CASE WHEN sym.is_abstract      IS NOT NULL THEN sym.is_abstract      ELSE s.is_abstract      END,
+            s.is_deprecated    = CASE WHEN sym.is_deprecated    IS NOT NULL THEN sym.is_deprecated    ELSE s.is_deprecated    END,
+            s.is_test          = CASE WHEN sym.is_test          IS NOT NULL THEN sym.is_test          ELSE s.is_test          END,
+            s.language         = CASE WHEN sym.language         IS NOT NULL THEN sym.language         ELSE s.language         END,
+            s.service          = CASE WHEN sym.service          IS NOT NULL THEN sym.service          ELSE s.service          END,
+            s.file_type        = CASE WHEN sym.file_type        IS NOT NULL THEN sym.file_type        ELSE s.file_type        END,
+            s.entry_point_type = CASE WHEN sym.entry_point_type IS NOT NULL THEN sym.entry_point_type ELSE s.entry_point_type END,
+            s.http_method      = CASE WHEN sym.http_method      IS NOT NULL THEN sym.http_method      ELSE s.http_method      END,
+            s.http_path        = CASE WHEN sym.http_path        IS NOT NULL THEN sym.http_path        ELSE s.http_path        END,
+            s.auth_required    = CASE WHEN sym.auth_required    IS NOT NULL THEN sym.auth_required    ELSE s.auth_required    END,
+            s.auth_roles       = CASE WHEN sym.auth_roles       IS NOT NULL THEN sym.auth_roles       ELSE s.auth_roles       END,
+            s.table_name       = CASE WHEN sym.table_name       IS NOT NULL THEN sym.table_name       ELSE s.table_name       END,
+            s.operation_type   = CASE WHEN sym.operation_type   IS NOT NULL THEN sym.operation_type   ELSE s.operation_type   END,
+            s.makes_http_call  = CASE WHEN sym.makes_http_call  IS NOT NULL THEN sym.makes_http_call  ELSE s.makes_http_call  END,
+            s.annotations_json = CASE WHEN sym.annotations_json IS NOT NULL THEN sym.annotations_json ELSE s.annotations_json END
 
         // 【新增：強制建立 File 節點與實體關聯】
         WITH s, sym
@@ -195,6 +222,11 @@ class GraphStore:
             "ANNOTATED_BY",
             # PHP trait usage: class uses trait
             "TRAIT_USE",
+            # Schema v2: new relationship types
+            "MANAGES",          # Repository/DAO → Entity
+            "RENDERS",          # Controller method → View file
+            "WRITES_TO",        # Repository method → Entity (DB write)
+            "READS_FROM",       # Repository method → Entity (DB read)
         }
 
         # Group by relationship type
@@ -231,6 +263,38 @@ class GraphStore:
                     MERGE (src)-[r:{rel_type}]->(tgt)
                     SET r.queue_name = rel.metadata.queue_name,
                         r.line       = rel.metadata.line
+                    RETURN count(r)
+                    """
+                elif rel_type == "ANNOTATED_BY":
+                    cypher = """
+                    UNWIND $rels AS rel
+                    MERGE (src:Symbol {fqn: rel.source, project: $default_project})
+                    MERGE (tgt:Symbol {fqn: rel.target, project: $default_project})
+                    ON CREATE SET tgt.name = COALESCE(rel.target_name, rel.target), tgt.kind = 'annotation'
+                    MERGE (src)-[r:ANNOTATED_BY]->(tgt)
+                    SET r.value = CASE WHEN rel.metadata.value IS NOT NULL THEN rel.metadata.value ELSE r.value END
+                    RETURN count(r)
+                    """
+                elif rel_type == "MANAGES":
+                    # Repository → Entity: target may be short name only, try FQN match then name match
+                    cypher = """
+                    UNWIND $rels AS rel
+                    MERGE (src:Symbol {fqn: rel.source, project: $default_project})
+                    WITH src, rel
+                    OPTIONAL MATCH (tgt:Symbol {project: $default_project})
+                        WHERE tgt.fqn = rel.target OR tgt.name = rel.target
+                    FOREACH (_ IN CASE WHEN tgt IS NOT NULL THEN [1] ELSE [] END |
+                        MERGE (src)-[:MANAGES]->(tgt)
+                    )
+                    RETURN count(src)
+                    """
+                elif rel_type == "RENDERS":
+                    # Controller method → View file (target = file path)
+                    cypher = """
+                    UNWIND $rels AS rel
+                    MERGE (src:Symbol {fqn: rel.source, project: $default_project})
+                    MERGE (tgt:File {path: rel.target, project: $default_project})
+                    MERGE (src)-[r:RENDERS]->(tgt)
                     RETURN count(r)
                     """
                 else:
@@ -597,6 +661,79 @@ class GraphStore:
                 logger.info("Successfully computed execution flows.")
         except Exception as e:
             logger.error(f"Failed to compute execution flows (APOC plugin might be missing): {e}")
+
+    def resolve_stub_calls(self, project: Optional[str] = None):
+        """Link external FQN stubs to their fully-qualified method signatures.
+
+        Spoon records a call to e.g. ``Service.create`` as an external stub
+        (kind='external'), while the real symbol has FQN
+        ``Service.create(ParamA,ParamB)``.  This pass creates direct CALLS edges
+        from every caller of a stub to all matching full-signature methods, so
+        the call graph remains connected across the signature boundary.
+        """
+        proj = project if project is not None else self.default_project
+        query = """
+        // Find external stubs that have at least one caller
+        MATCH (caller:Symbol {project: $proj})-[:CALLS]->(stub:Symbol {project: $proj, kind: 'external'})
+        // Find real methods whose FQN starts with stub.fqn + '('
+        MATCH (resolved:Symbol {project: $proj})
+        WHERE resolved.kind <> 'external'
+          AND resolved.fqn STARTS WITH (stub.fqn + '(')
+        // Add a direct CALLS edge, preserving the caller
+        MERGE (caller)-[:CALLS {resolved_from_stub: true}]->(resolved)
+        RETURN count(*) AS linked
+        """
+        try:
+            with self.driver.session(database=self.database) as session:
+                result = session.run(query, proj=proj)
+                record = result.single()
+                linked = record["linked"] if record else 0
+                logger.info(f"resolve_stub_calls: linked {linked} stub → full-sig edges for project '{proj}'")
+        except Exception as e:
+            logger.error(f"resolve_stub_calls failed: {e}")
+
+    def resolve_virtual_dispatch(self, project: Optional[str] = None):
+        """Add CALLS edges through interface / abstract method boundaries.
+
+        When a caller invokes an interface or abstract method, static analysis
+        stops there.  This pass finds every concrete class that implements /
+        inherits that interface and adds CALLS edges from the original caller to
+        the matching method on each concrete class, so the call graph can be
+        traversed without knowing the runtime type.
+
+        Also handles INHERITS (abstract-class overrides) with the same logic.
+        """
+        proj = project if project is not None else self.default_project
+        query = """
+        // Step 1: caller → interface/abstract method
+        MATCH (caller:Symbol {project: $proj})-[:CALLS]->(iface_method:Symbol {project: $proj})
+        WHERE iface_method.kind IN ['method', 'external']
+
+        // Step 2: the interface/abstract class that owns the method
+        MATCH (iface_method)-[:MEMBER_OF]->(iface_class:Symbol {project: $proj})
+        WHERE iface_class.kind IN ['class', 'interface', 'abstract_class']
+
+        // Step 3: concrete classes that implement / inherit from iface_class
+        MATCH (concrete:Symbol {project: $proj})-[:IMPLEMENTS|INHERITS]->(iface_class)
+
+        // Step 4: method with the same base name on the concrete class
+        MATCH (concrete_method:Symbol {project: $proj})-[:MEMBER_OF]->(concrete)
+        WHERE split(concrete_method.name, '(')[0] = split(iface_method.name, '(')[0]
+          AND concrete_method.kind IN ['method']
+          AND concrete_method.fqn <> iface_method.fqn
+
+        // Add virtual-dispatch CALLS edge
+        MERGE (caller)-[:CALLS {virtual_dispatch: true}]->(concrete_method)
+        RETURN count(*) AS linked
+        """
+        try:
+            with self.driver.session(database=self.database) as session:
+                result = session.run(query, proj=proj)
+                record = result.single()
+                linked = record["linked"] if record else 0
+                logger.info(f"resolve_virtual_dispatch: linked {linked} virtual-dispatch edges for project '{proj}'")
+        except Exception as e:
+            logger.error(f"resolve_virtual_dispatch failed: {e}")
 
     def delete_project(self, project: Optional[str] = None) -> int:
         """Delete all nodes and relationships associated with a project.

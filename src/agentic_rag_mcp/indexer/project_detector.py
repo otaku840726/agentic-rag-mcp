@@ -31,6 +31,7 @@ class AnalyzerType(Enum):
     SPOON = "spoon"               # Java via Docker
     ROSLYN = "roslyn"             # C# via Docker
     PHP_PARSER = "php-parser"     # PHP via Docker (nikic/PHP-Parser)
+    SCIP = "scip"                 # Universal SCIP indexer (TypeScript/Python/Go) via Docker
     TREE_SITTER = "tree-sitter"   # Fallback for all languages
 
 
@@ -334,11 +335,11 @@ class ProjectDetector:
         dockerfile_dir = None
         
         if analyzer_type == AnalyzerType.ROSLYN:
-            # Roslyn analyzer Dockerfile is in analyzers/csharp/
             dockerfile_dir = Path(__file__).parent.parent / "analyzers" / "csharp"
         elif analyzer_type == AnalyzerType.SPOON:
-            # Spoon analyzer Dockerfile (if it exists)
             dockerfile_dir = Path(__file__).parent.parent / "analyzers" / "java"
+        elif analyzer_type == AnalyzerType.SCIP:
+            dockerfile_dir = Path(__file__).parent.parent / "analyzers" / "scip"
         
         if not dockerfile_dir or not dockerfile_dir.exists():
             logger.error(f"Dockerfile directory not found for {analyzer_type.value}: {dockerfile_dir}")

@@ -14,6 +14,7 @@ import spoon.reflect.visitor.CtScanner;
 import java.io.File;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
@@ -92,9 +93,25 @@ public class SpoonAnalyzer {
         int startLine = type.getPosition().isValidPosition() ? type.getPosition().getLine() : 0;
         int endLine = type.getPosition().isValidPosition() ? type.getPosition().getEndLine() : 0;
 
+        // Compute class-level semantic fields once (used by class sym + passed to methods)
+        ObjectNode classAnnotations = extractAnnotationValues(type.getAnnotations());
+        String classFileType = classifyFileType(classAnnotations, type.getSimpleName(), filePath);
+        // Class-level @RequestMapping base path for HTTP controller methods
+        String httpBase = classAnnotations.has("RequestMapping")
+            ? classAnnotations.get("RequestMapping").asText("") : "";
+        // Class-level table name from @Table or Entity convention
+        String classTableName = null;
+        if (classAnnotations.has("Table")) {
+            String tv = classAnnotations.get("Table").asText("");
+            classTableName = tv.isEmpty() ? camelToSnake(type.getSimpleName()) : tv;
+        } else if (classAnnotations.has("Entity")) {
+            classTableName = camelToSnake(type.getSimpleName());
+        }
+
         if (!seen.contains(fqn)) {
             seen.add(fqn);
             ObjectNode sym = mapper.createObjectNode();
+            sym.put("fqn", fqn);
             sym.put("name", fqn);
             sym.put("node_type", kind);
             sym.put("content", getShortSignature(type));
@@ -102,6 +119,13 @@ public class SpoonAnalyzer {
             sym.put("end_line", endLine);
             sym.put("start_byte", 0);
             sym.put("end_byte", 0);
+            sym.put("visibility", getVisibilityString(type.getVisibility()));
+            sym.put("is_static", type.getModifiers().contains(ModifierKind.STATIC));
+            sym.put("is_abstract", type.getModifiers().contains(ModifierKind.ABSTRACT));
+            sym.put("is_deprecated", hasDeprecated(type.getAnnotations()));
+            sym.set("annotations", classAnnotations);
+            if (classFileType != null) sym.put("file_type", classFileType);
+            if (classTableName != null) sym.put("table_name", classTableName);
 
             ObjectNode meta = mapper.createObjectNode();
             meta.put("file_path", "/src/" + filePath);
@@ -140,6 +164,11 @@ public class SpoonAnalyzer {
                     sym.put("end_line", ev.getPosition().isValidPosition() ? ev.getPosition().getEndLine() : 0);
                     sym.put("start_byte", 0);
                     sym.put("end_byte", 0);
+                    sym.put("visibility", "public");
+                    sym.put("is_static", true);
+                    sym.put("is_abstract", false);
+                    sym.put("is_deprecated", hasDeprecated(ev.getAnnotations()));
+                    sym.set("annotations", extractAnnotationValues(ev.getAnnotations()));
                     ObjectNode meta = mapper.createObjectNode();
                     meta.put("file_path", "/src/" + filePath);
                     meta.put("namespace", type.getPackage() != null ? type.getPackage().getQualifiedName() : "");
@@ -152,7 +181,8 @@ public class SpoonAnalyzer {
 
         // Methods → symbols + MEMBER_OF + CALLS + USES_TYPE  [Bug 1 fix: MEMBER_OF now added]
         for (CtMethod<?> method : type.getMethods()) {
-            processMethod(method, fqn, filePath, symbols, relationships, seen, type);
+            processMethod(method, fqn, filePath, symbols, relationships, seen, type,
+                          classAnnotations, httpBase, classFileType, classTableName);
         }
 
         // Bug 3 fix: Constructors → symbols + MEMBER_OF + CALLS + USES_TYPE
@@ -176,7 +206,9 @@ public class SpoonAnalyzer {
 
     private static void processMethod(CtMethod<?> method, String ownerFqn, String filePath,
                                        ArrayNode symbols, ArrayNode relationships,
-                                       Set<String> seen, CtType<?> ownerType) {
+                                       Set<String> seen, CtType<?> ownerType,
+                                       ObjectNode classAnnotations, String httpBase,
+                                       String classFileType, String classTableName) {
         // Bug 4 fix: include param types in FQN to support overloaded methods
         String paramSig = method.getParameters().stream()
             .map(p -> p.getType().getSimpleName())
@@ -187,7 +219,61 @@ public class SpoonAnalyzer {
 
         if (!seen.contains(methodFqn)) {
             seen.add(methodFqn);
+            ObjectNode methodAnnotations = extractAnnotationValues(method.getAnnotations());
+
+            // ── Semantic enrichment (no Python post-processing needed) ──────
+            // entry_point_type
+            String entryPointType = null;
+            String httpMethod = null;
+            String httpPath = null;
+            if (methodAnnotations.has("Scheduled")) {
+                entryPointType = "cron";
+            } else if (methodAnnotations.has("EventListener")) {
+                entryPointType = "event";
+            } else if (methodAnnotations.has("RabbitListener") || methodAnnotations.has("KafkaListener")) {
+                entryPointType = "queue";
+            } else {
+                httpMethod = extractHttpMethod(methodAnnotations);
+                if (httpMethod != null) {
+                    entryPointType = "api";
+                    String methodPath = extractHttpPath(methodAnnotations);
+                    if (httpBase != null && !httpBase.isEmpty()) {
+                        String base = httpBase.endsWith("/") ? httpBase.substring(0, httpBase.length() - 1) : httpBase;
+                        String mp = (methodPath != null && !methodPath.isEmpty())
+                            ? (methodPath.startsWith("/") ? methodPath : "/" + methodPath) : "";
+                        httpPath = (base + mp).isEmpty() ? "/" : base + mp;
+                        httpPath = httpPath.replaceAll("//+", "/");
+                    } else {
+                        httpPath = methodPath;
+                    }
+                }
+            }
+
+            // auth_required / auth_roles
+            Boolean authRequired = null;
+            String authRoles = null;
+            if (methodAnnotations.has("PreAuthorize")) {
+                authRequired = true;
+                authRoles = methodAnnotations.get("PreAuthorize").asText("");
+            } else if (methodAnnotations.has("Secured")) {
+                authRequired = true;
+                authRoles = methodAnnotations.get("Secured").asText("");
+            } else if (methodAnnotations.has("RolesAllowed")) {
+                authRequired = true;
+                authRoles = methodAnnotations.get("RolesAllowed").asText("");
+            }
+
+            // operation_type (method name heuristics or @Modifying)
+            String operationType = extractOperationType(methodAnnotations, method.getSimpleName());
+
+            // table_name: inherit from class if present
+            String tableName = classTableName;
+
+            // makes_http_call: scan method body for HTTP client usage
+            boolean makesHttpCall = detectHttpCall(method);
+
             ObjectNode sym = mapper.createObjectNode();
+            sym.put("fqn", methodFqn);
             sym.put("name", methodFqn);
             sym.put("node_type", "method");
             sym.put("content", method.getSimpleName() + getParamSignature(method));
@@ -195,6 +281,23 @@ public class SpoonAnalyzer {
             sym.put("end_line", endLine);
             sym.put("start_byte", 0);
             sym.put("end_byte", 0);
+            sym.put("visibility", getVisibilityString(method.getVisibility()));
+            sym.put("is_static", method.getModifiers().contains(ModifierKind.STATIC));
+            sym.put("is_abstract", method.getModifiers().contains(ModifierKind.ABSTRACT));
+            sym.put("is_deprecated", hasDeprecated(method.getAnnotations()));
+            sym.put("return_type", method.getType() != null ? method.getType().getSimpleName() : "");
+            sym.put("params", buildParamsJson(method.getParameters()));
+            sym.set("annotations", methodAnnotations);
+            // Semantic fields
+            if (classFileType != null) sym.put("file_type", classFileType);
+            if (entryPointType != null) sym.put("entry_point_type", entryPointType);
+            if (httpMethod != null) sym.put("http_method", httpMethod);
+            if (httpPath != null) sym.put("http_path", httpPath);
+            if (authRequired != null) sym.put("auth_required", authRequired);
+            if (authRoles != null) sym.put("auth_roles", authRoles);
+            if (operationType != null) sym.put("operation_type", operationType);
+            if (tableName != null) sym.put("table_name", tableName);
+            if (makesHttpCall) sym.put("makes_http_call", true);
             ObjectNode meta = mapper.createObjectNode();
             meta.put("file_path", "/src/" + filePath);
             meta.put("namespace", ownerType.getPackage() != null ? ownerType.getPackage().getQualifiedName() : "");
@@ -300,6 +403,12 @@ public class SpoonAnalyzer {
         sym.put("end_line", endLine);
         sym.put("start_byte", 0);
         sym.put("end_byte", 0);
+        sym.put("visibility", getVisibilityString(ctor.getVisibility()));
+        sym.put("is_static", false);
+        sym.put("is_abstract", false);
+        sym.put("is_deprecated", hasDeprecated(ctor.getAnnotations()));
+        sym.put("params", buildParamsJson(ctor.getParameters()));
+        sym.set("annotations", extractAnnotationValues(ctor.getAnnotations()));
         ObjectNode meta = mapper.createObjectNode();
         meta.put("file_path", "/src/" + filePath);
         meta.put("namespace", ownerType.getPackage() != null ? ownerType.getPackage().getQualifiedName() : "");
@@ -359,6 +468,12 @@ public class SpoonAnalyzer {
         sym.put("end_line", startLine);
         sym.put("start_byte", 0);
         sym.put("end_byte", 0);
+        sym.put("visibility", getVisibilityString(field.getVisibility()));
+        sym.put("is_static", field.getModifiers().contains(ModifierKind.STATIC));
+        sym.put("is_abstract", false);
+        sym.put("is_deprecated", hasDeprecated(field.getAnnotations()));
+        sym.put("return_type", field.getType() != null ? field.getType().getSimpleName() : "");
+        sym.set("annotations", extractAnnotationValues(field.getAnnotations()));
         ObjectNode meta = mapper.createObjectNode();
         meta.put("file_path", "/src/" + filePath);
         meta.put("namespace", ownerType.getPackage() != null ? ownerType.getPackage().getQualifiedName() : "");
@@ -377,6 +492,94 @@ public class SpoonAnalyzer {
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    /** Convert ModifierKind visibility to lowercase string, null → "package" */
+    private static String getVisibilityString(ModifierKind vis) {
+        if (vis == null) return "package";
+        switch (vis) {
+            case PUBLIC:    return "public";
+            case PROTECTED: return "protected";
+            case PRIVATE:   return "private";
+            default:        return "package";
+        }
+    }
+
+    /** True if any annotation is @Deprecated */
+    private static boolean hasDeprecated(Collection<CtAnnotation<?>> annotations) {
+        return annotations.stream().anyMatch(a -> {
+            try { return a.getAnnotationType().getSimpleName().equals("Deprecated"); }
+            catch (Exception e) { return false; }
+        });
+    }
+
+    /**
+     * Extract annotation name → first string value map for ALL annotations
+     * (including Spring/external ones — used for payload enrichment in Python).
+     * Examples:
+     *   @GetMapping("/deposit")              → {"GetMapping": "/deposit"}
+     *   @Table(name = "deposits")            → {"Table": "deposits"}
+     *   @Scheduled(cron = "0 * * * * ?")     → {"Scheduled": "0 * * * * ?"}
+     *   @Transactional                        → {"Transactional": ""}
+     */
+    private static ObjectNode extractAnnotationValues(Collection<CtAnnotation<?>> annotations) {
+        ObjectNode result = mapper.createObjectNode();
+        for (CtAnnotation<?> ann : annotations) {
+            try {
+                String simpleName = ann.getAnnotationType().getSimpleName();
+                String value = extractPrimaryAnnotationValue(ann);
+                result.put(simpleName, value);
+            } catch (Exception ignored) {}
+        }
+        return result;
+    }
+
+    /**
+     * Get the "primary" string value of an annotation.
+     * Priority: value attribute → first named attribute → empty string.
+     */
+    private static String extractPrimaryAnnotationValue(CtAnnotation<?> ann) {
+        // Try "value" first (most common: @GetMapping("/path"), @Table(name="..."))
+        for (String attr : List.of("value", "name", "cron", "path", "mapping")) {
+            try {
+                CtExpression<?> expr = ann.getValue(attr);
+                if (expr != null) {
+                    List<String> vals = extractStringLiterals(expr);
+                    if (!vals.isEmpty()) return String.join(",", vals);
+                }
+            } catch (Exception ignored) {}
+        }
+        // Try any attribute — skip non-path attributes (produces, consumes, etc.)
+        try {
+            Set<String> nonPathAttrs = Set.of("produces", "consumes", "headers", "params", "method");
+            Map<String, CtExpression> allValues = ann.getValues();
+            if (allValues != null && !allValues.isEmpty()) {
+                for (Map.Entry<String, CtExpression> entry : allValues.entrySet()) {
+                    if (nonPathAttrs.contains(entry.getKey())) continue;
+                    List<String> vals = extractStringLiterals(entry.getValue());
+                    if (!vals.isEmpty()) return String.join(",", vals);
+                }
+            }
+        } catch (Exception ignored) {}
+        return "";
+    }
+
+    /**
+     * Build params JSON array string: [{"name":"amount","type":"BigDecimal"},...]
+     */
+    private static String buildParamsJson(List<CtParameter<?>> params) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < params.size(); i++) {
+            if (i > 0) sb.append(",");
+            CtParameter<?> p = params.get(i);
+            String name = p.getSimpleName();
+            String type = p.getType() != null ? p.getType().getSimpleName() : "Object";
+            sb.append("{\"name\":\"").append(name.replace("\"", "\\\""))
+              .append("\",\"type\":\"").append(type.replace("\"", "\\\""))
+              .append("\"}");
+        }
+        sb.append("]");
+        return sb.toString();
+    }
 
     /**
      * Emit ANNOTATED_BY edges for all non-external annotations on a code element.
@@ -560,5 +763,100 @@ public class SpoonAnalyzer {
         rel.put("type", type);
         rel.set("metadata", mapper.createObjectNode());
         relationships.add(rel);
+    }
+
+    // ── Semantic enrichment helpers ───────────────────────────────────────────
+
+    /**
+     * Classify file_type from class-level Spring annotations + naming conventions.
+     * Returns null if cannot be determined.
+     */
+    private static String classifyFileType(ObjectNode annotations, String simpleName, String filePath) {
+        // Annotation-based (most reliable)
+        if (annotations.has("RestController") || annotations.has("Controller")) return "controller";
+        if (annotations.has("Service")) return "service";
+        if (annotations.has("Repository")) return "repository";
+        if (annotations.has("Entity")) return "entity";
+        if (annotations.has("Configuration") || annotations.has("SpringBootApplication")) return "config";
+        if (annotations.has("Aspect")) return "middleware";
+        if (annotations.has("ControllerAdvice") || annotations.has("RestControllerAdvice")) return "middleware";
+        if (annotations.has("Component")) return "service";
+
+        // Naming convention fallback
+        String name = simpleName.toLowerCase();
+        if (name.endsWith("controller")) return "controller";
+        if (name.endsWith("service") || name.endsWith("serviceimpl")) return "service";
+        if (name.endsWith("repository") || name.endsWith("repo")) return "repository";
+        if (name.endsWith("entity")) return "entity";
+        if (name.endsWith("dto") || name.endsWith("vo") || name.endsWith("request")
+                || name.endsWith("response") || name.endsWith("command") || name.endsWith("event")) return "dto";
+        if (name.endsWith("config") || name.endsWith("configuration")) return "config";
+        if (name.endsWith("job") || name.endsWith("task") || name.endsWith("scheduler")) return "job";
+        if (name.endsWith("listener") || name.endsWith("handler")) return "event_listener";
+
+        // Path-based fallback
+        String fp = filePath.replace("\\", "/").toLowerCase();
+        if (fp.contains("/controller/") || fp.contains("/controllers/")) return "controller";
+        if (fp.contains("/service/") || fp.contains("/services/")) return "service";
+        if (fp.contains("/repository/") || fp.contains("/repositories/")) return "repository";
+        if (fp.contains("/entity/") || fp.contains("/entities/") || fp.contains("/model/")) return "entity";
+
+        return null;
+    }
+
+    /** Extract HTTP verb from Spring mapping annotations. */
+    private static String extractHttpMethod(ObjectNode annotations) {
+        if (annotations.has("GetMapping")) return "GET";
+        if (annotations.has("PostMapping")) return "POST";
+        if (annotations.has("PutMapping")) return "PUT";
+        if (annotations.has("DeleteMapping")) return "DELETE";
+        if (annotations.has("PatchMapping")) return "PATCH";
+        if (annotations.has("RequestMapping")) return "GET";  // default; actual method= not parsed
+        return null;
+    }
+
+    /** Extract HTTP path from Spring mapping annotations. */
+    private static String extractHttpPath(ObjectNode annotations) {
+        for (String ann : List.of("GetMapping", "PostMapping", "PutMapping",
+                                   "DeleteMapping", "PatchMapping", "RequestMapping")) {
+            if (annotations.has(ann)) {
+                return annotations.get(ann).asText("");
+            }
+        }
+        return null;
+    }
+
+    /** Derive operation_type from @Modifying or method name prefix heuristics. */
+    private static String extractOperationType(ObjectNode annotations, String methodName) {
+        if (annotations.has("Modifying")) return "WRITE";
+        String name = methodName.toLowerCase();
+        if (name.startsWith("save") || name.startsWith("insert") || name.startsWith("update")
+                || name.startsWith("delete") || name.startsWith("remove") || name.startsWith("create")
+                || name.startsWith("add") || name.startsWith("put") || name.startsWith("write")) {
+            return "WRITE";
+        }
+        if (name.startsWith("find") || name.startsWith("get") || name.startsWith("load")
+                || name.startsWith("fetch") || name.startsWith("select") || name.startsWith("read")
+                || name.startsWith("list") || name.startsWith("count") || name.startsWith("exists")
+                || name.startsWith("query") || name.startsWith("search")) {
+            return "READ";
+        }
+        return null;
+    }
+
+    /** Scan method body for known HTTP client types. */
+    private static boolean detectHttpCall(CtMethod<?> method) {
+        if (method.getBody() == null) return false;
+        String body = method.getBody().toString();
+        return body.contains("RestTemplate") || body.contains("WebClient")
+            || body.contains("HttpClient") || body.contains("restTemplate")
+            || body.contains("webClient") || body.contains("FeignClient");
+    }
+
+    /** Convert CamelCase class name to snake_case (for default table name). */
+    private static String camelToSnake(String name) {
+        String s = name.replaceAll("([A-Z]+)([A-Z][a-z])", "$1_$2");
+        s = s.replaceAll("([a-z\\d])([A-Z])", "$1_$2");
+        return s.toLowerCase();
     }
 }

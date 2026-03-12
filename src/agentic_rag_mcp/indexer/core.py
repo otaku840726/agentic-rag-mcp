@@ -22,6 +22,8 @@ from .bm25_tokenizer import Bm25Tokenizer
 from .chunker import Chunker
 from .qdrant_ops import QdrantOps
 from .analyzer import AnalyzerFactory, save_analysis_artifact
+from .enricher import enrich_payload
+from .php_routes_parser import parse_routes_files
 from qdrant_client.http import models
 
 logger = logging.getLogger(__name__)
@@ -81,10 +83,12 @@ PAYLOAD_ONLY_METADATA = {
 DEFAULT_EXCLUDE_DIRS = {
     "bin", "obj", "node_modules", ".git", "packages",
     "__pycache__", ".venv", "venv", "dist", "build",
-    "TestResults", ".vs", ".idea",
+    "TestResults", ".vs", ".idea", ".vscode", ".eclipse",
     ".agentic-rag-cache",
     "target",           # Maven/Gradle build output
     ".gradle",          # Gradle cache
+    "coverage",         # test coverage reports
+    "tmp", "temp", "logs", ".cache", ".temp",
 }
 
 # Filenames / suffixes always excluded (auto-generated, lock files, etc.)
@@ -94,6 +98,14 @@ EXCLUDED_FILENAME_PATTERNS = {
     "package-lock.json", "yarn.lock", "pnpm-lock.yaml",       # lock files
     ".min.js", ".min.css", ".map",                             # minified / sourcemaps
     ".nupkg.metadata",                                         # NuGet metadata
+    ".d.ts",                                                   # TypeScript declaration files (auto-generated)
+}
+
+# Exact filenames to always exclude (security-sensitive or noise)
+EXCLUDED_EXACT_FILENAMES = {
+    ".env", ".env.local", ".env.development", ".env.production",
+    ".env.staging", ".env.test",
+    # .env.example / .env.sample intentionally kept — no real secrets expected
 }
 
 # 副檔名 → (category, language) 映射 (also serves as the base whitelist)
@@ -103,6 +115,8 @@ EXT_CATEGORY_MAP = {
     ".cshtml":     ("source-code", "csharp"),
     ".razor":      ("source-code", "csharp"),
     ".xaml":       ("source-code", "csharp"),       # MAUI / WPF UI definitions
+    ".sln":        ("configuration", "csharp"),     # VS Solution — graph anchor for Roslyn
+    ".csproj":     ("configuration", "csharp"),     # VS Project — dependency metadata
 
     # ── JVM ──
     ".java":       ("source-code", "java"),
@@ -116,6 +130,7 @@ EXT_CATEGORY_MAP = {
     ".js":         ("source-code", "javascript"),
     ".jsx":        ("source-code", "javascript"),
     ".cjs":        ("source-code", "javascript"),   # CommonJS
+    ".mjs":        ("source-code", "javascript"),   # ES Module
     ".ts":         ("source-code", "typescript"),
     ".tsx":        ("source-code", "typescript"),
 
@@ -549,6 +564,55 @@ class IndexerService:
             else:
                 logger.warning("Multiple top-level directories detected, skipping bulk cleanup")
 
+        # ── Pre-enrichment setup ────────────────────────────────────────────
+        # 1. PHP routes map: parse all routes/*.php files in the project root
+        #    so controller methods can get their http_path/method filled in.
+        routes_map: dict = {}
+        try:
+            routes_map = parse_routes_files(str(self.base_dir))
+            if routes_map:
+                logger.info(f"PHP routes map built: {sum(len(v) for v in routes_map.values())} routes across {len(routes_map)} controllers")
+        except Exception as e:
+            logger.warning(f"PHP routes parsing failed (non-fatal): {e}")
+
+        # 2. Class annotations map: pre-scan all symbols to collect class-level
+        #    annotations, so method enrichment can resolve full HTTP paths.
+        #    {class_fqn: {annotations, content, http_base_path, route_template}}
+        class_info_map: dict = {}
+        for json_file in json_files:
+            try:
+                with open(json_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                language = data.get("language", "")
+                for sym in data.get("symbols", []):
+                    if sym.get("node_type") not in ("class", "abstract_class", "interface"):
+                        continue
+                    fqn = sym.get("fqn") or sym.get("name", "")
+                    if not fqn:
+                        continue
+                    annotations = sym.get("annotations") or {}
+                    content = sym.get("content") or ""
+                    info: dict = {"annotations": annotations, "content": content, "language": language}
+
+                    # Java: class-level RequestMapping base path
+                    base_path = annotations.get("RequestMapping") or ""
+                    info["http_base_path"] = base_path.split(",")[0].strip() if base_path else ""
+
+                    # C#: class-level [Route(...)] template
+                    if language == "csharp":
+                        route_m = re.search(r'\[Route\("([^"]+)"\)\]', content)
+                        info["route_template"] = route_m.group(1) if route_m else ""
+                        # Short controller name (strip "Controller" suffix)
+                        short = fqn.split(".")[-1]
+                        if "(" in short:
+                            short = short.split("(")[0]
+                        info["ctrl_short"] = short[:-10] if short.lower().endswith("controller") else short
+
+                    class_info_map[fqn] = info
+            except Exception:
+                pass
+        # ── End pre-enrichment setup ─────────────────────────────────────────
+
         # Second pass: index all artifacts
         for json_file in json_files:
             try:
@@ -615,7 +679,48 @@ class IndexerService:
                         for k, v in sym.items():
                             if k not in ["content", "metadata_header"]:
                                  payload[k] = v
-                        
+
+                        # ── Enrichment ──────────────────────────────────────
+                        language = data.get("language", "")
+                        payload["language"] = language
+                        enrich_payload(payload, content=content, routes_map=routes_map)
+
+                        # Resolve full http_path for methods (class base + method path)
+                        if payload.get("symbol_type") == "method" and payload.get("_method_path") is not None:
+                            method_path = payload.pop("_method_path", "")
+                            # Find parent class FQN (method FQN = Class.FQN.methodName(params))
+                            raw_fqn = sym.get("name") or ""
+                            # Strip param signature and last segment
+                            base_fqn = raw_fqn.rsplit(".", 1)[0] if "." in raw_fqn else ""
+                            base_fqn = re.sub(r"\(.*\)$", "", base_fqn)
+                            cls_info = class_info_map.get(base_fqn, {})
+
+                            if language == "java":
+                                base = cls_info.get("http_base_path", "").rstrip("/")
+                                full = (base + "/" + method_path.lstrip("/")).rstrip("/")
+                                payload["http_path"] = full or "/"
+
+                            elif language == "csharp":
+                                template = cls_info.get("route_template", "")
+                                ctrl_short = cls_info.get("ctrl_short", "")
+                                action = raw_fqn.split(".")[-1].split("(")[0]
+                                if template:
+                                    resolved = template \
+                                        .replace("[controller]", ctrl_short.lower()) \
+                                        .replace("[Controller]", ctrl_short) \
+                                        .replace("[action]", action) \
+                                        .replace("[Action]", action)
+                                    # Prepend method-level path if present
+                                    if method_path:
+                                        resolved = resolved.rstrip("/") + "/" + method_path.lstrip("/")
+                                    payload["http_path"] = "/" + resolved.lstrip("/")
+                                elif ctrl_short:
+                                    # MVC convention: /ControllerShort/ActionName
+                                    payload["http_path"] = f"/{ctrl_short}/{action}"
+                        elif "_method_path" in payload:
+                            payload.pop("_method_path", None)
+                        # ── End enrichment ───────────────────────────────────
+
                         payloads.append(payload)
 
                     if not texts:
@@ -685,6 +790,19 @@ class IndexerService:
                             else:
                                 actual_file_path = rel_path
 
+                            # Build enriched payload for graph node properties
+                            _graph_enrich = {
+                                "file_path": actual_file_path,
+                                "symbol_name": fqn,
+                                "symbol_type": sym.get("node_type", ""),
+                                "language": data.get("language", ""),
+                            }
+                            for _k, _v in sym.items():
+                                if _k not in ("content", "metadata_header"):
+                                    _graph_enrich[_k] = _v
+                            _graph_enrich["language"] = data.get("language", "")
+                            enrich_payload(_graph_enrich, content=sym.get("content", ""), routes_map=routes_map)
+
                             graph_symbols.append({
                                 "fqn": fqn,
                                 "name": short_name,
@@ -694,7 +812,83 @@ class IndexerService:
                                 "start_line": sym.get("start_line", 0),
                                 "end_line": sym.get("end_line", 0),
                                 "project": self.graph_store.default_project,
+                                # New schema fields
+                                "visibility":       sym.get("visibility"),
+                                "is_static":        sym.get("is_static"),
+                                "is_abstract":      sym.get("is_abstract"),
+                                "is_deprecated":    sym.get("is_deprecated"),
+                                "language":         data.get("language", ""),
+                                "service":          rel_path.split("/")[0] if "/" in rel_path else "",
+                                "file_type":        _graph_enrich.get("file_type"),
+                                "is_test":          _graph_enrich.get("is_test"),
+                                "entry_point_type": _graph_enrich.get("entry_point_type"),
+                                "http_method":      _graph_enrich.get("http_method"),
+                                "http_path":        _graph_enrich.get("http_path"),
+                                "auth_required":    _graph_enrich.get("auth_required"),
+                                "auth_roles":       _graph_enrich.get("auth_roles"),
+                                "table_name":       _graph_enrich.get("table_name"),
+                                "operation_type":   _graph_enrich.get("operation_type"),
+                                "makes_http_call":  _graph_enrich.get("makes_http_call"),
                             })
+
+                            # ── MANAGES relationship extraction ──────────────
+                            _content = sym.get("content", "")
+                            _lang = data.get("language", "")
+                            _manages_target = None
+
+                            if _lang == "java":
+                                _m = re.search(r'extends\s+\w*Repository\s*<\s*(\w+)', _content)
+                                if not _m:
+                                    _m = re.search(r'JpaRepository\s*<\s*(\w+)', _content)
+                                if _m:
+                                    _manages_target = _m.group(1)
+
+                            elif _lang == "csharp":
+                                _m = re.search(r'baseDao\s*<\s*(\w+)', _content)
+                                if _m:
+                                    _manages_target = _m.group(1)
+
+                            elif _lang == "php":
+                                _m = re.search(r'protected\s+\$model\s*=\s*(\w+)::class', _content)
+                                if _m:
+                                    _manages_target = _m.group(1)
+
+                            if _manages_target:
+                                extra_rels.append({
+                                    "type": "MANAGES",
+                                    "source": fqn,
+                                    "target": _manages_target,
+                                    "metadata": {},
+                                })
+
+                            # ── RENDERS relationship (Controller method → View) ──
+                            if sym.get("node_type") == "method":
+                                _renders_target = None
+                                if _lang == "csharp":
+                                    _rv = re.search(r'return\s+View\(\s*["\']([^"\']+)["\']', _content)
+                                    if _rv:
+                                        _view_name = _rv.group(1)
+                                        # Resolve to .cshtml path relative to project
+                                        _ctrl_dir = str(Path(actual_file_path).parent)
+                                        _renders_target = _ctrl_dir + f"/{_view_name}.cshtml"
+                                    elif re.search(r'return\s+View\(\s*\)', _content):
+                                        # Convention: view name = method name
+                                        _action = short_name
+                                        _ctrl_dir = str(Path(actual_file_path).parent)
+                                        _renders_target = _ctrl_dir + f"/{_action}.cshtml"
+                                elif _lang == "php":
+                                    _rv = re.search(r'return\s+view\(\s*["\']([^"\']+)["\']', _content)
+                                    if _rv:
+                                        _view_name = _rv.group(1).replace(".", "/")
+                                        _renders_target = f"resources/views/{_view_name}.blade.php"
+
+                                if _renders_target:
+                                    extra_rels.append({
+                                        "type": "RENDERS",
+                                        "source": fqn,
+                                        "target": _renders_target,
+                                        "metadata": {},
+                                    })
 
                             # Roslyn doesn't emit MEMBER_OF for enum members — synthesize them.
                             if sym.get("node_type") == "enum_member" and "." in fqn:
@@ -779,6 +973,71 @@ class IndexerService:
             logger.error(f"Error deleting by path prefix '{prefix}': {e}")
             return 0
 
+    # ── Service name helpers ───────────────────────────────────────
+
+    @staticmethod
+    def _build_service_map(dir_path: Path) -> Dict[str, str]:
+        """Scan dir_path for manifest files and return {directory_str: service_name}.
+
+        Priority (highest to lowest within the same directory):
+          composer.json > pom.xml > *.csproj > package.json
+        Nearest ancestor wins at lookup time.
+        """
+        service_map: Dict[str, str] = {}
+
+        # PHP — composer.json: {"name": "vendor/package"}
+        for f in dir_path.rglob("composer.json"):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8", errors="ignore"))
+                name = data.get("name", "")
+                if name and "/" in name:
+                    name = name.split("/")[-1]
+                if name:
+                    service_map.setdefault(str(f.parent), name)
+            except Exception:
+                pass
+
+        # Java — pom.xml: <artifactId>xxx</artifactId>
+        for f in dir_path.rglob("pom.xml"):
+            try:
+                content = f.read_text(encoding="utf-8", errors="ignore")
+                m = re.search(r"<artifactId>\s*([^<\s]+)\s*</artifactId>", content)
+                if m:
+                    service_map.setdefault(str(f.parent), m.group(1))
+            except Exception:
+                pass
+
+        # C# — *.csproj filename = project name
+        for f in dir_path.rglob("*.csproj"):
+            service_map.setdefault(str(f.parent), f.stem)
+
+        # JS/TS — package.json: {"name": "my-app"} (skip node_modules)
+        for f in dir_path.rglob("package.json"):
+            if "node_modules" in f.parts:
+                continue
+            try:
+                data = json.loads(f.read_text(encoding="utf-8", errors="ignore"))
+                name = data.get("name", "")
+                if name:
+                    service_map.setdefault(str(f.parent), name)
+            except Exception:
+                pass
+
+        return service_map
+
+    @staticmethod
+    def _resolve_service(abs_path: Path, dir_path: Path, service_map: Dict[str, str]) -> Optional[str]:
+        """Walk up from abs_path's directory to dir_path, return the nearest service name or None."""
+        current = abs_path.parent
+        while True:
+            name = service_map.get(str(current))
+            if name:
+                return name
+            if current == dir_path or current == current.parent:
+                break
+            current = current.parent
+        return None
+
     # ── Hash helpers ──────────────────────────────────────────────
 
     @staticmethod
@@ -833,7 +1092,11 @@ class IndexerService:
         if any(p in get_exclude_dirs() for p in parts):
             return True
 
-        # 2. Excluded filename patterns (suffix match, e.g. ".Designer.cs")
+        # 2. Excluded exact filenames (e.g. .env, .env.local)
+        if fname in EXCLUDED_EXACT_FILENAMES:
+            return True
+
+        # 2b. Excluded filename patterns (suffix match, e.g. ".Designer.cs", ".d.ts")
         for pattern in get_excluded_filename_patterns():
             if fname.endswith(pattern):
                 return True
@@ -870,6 +1133,17 @@ class IndexerService:
         warning = self._ensure_collection()
         dir_path = Path(directory).resolve()
 
+        # Determine the root used for computing relative paths.
+        # When dir_path is inside base_dir (the normal case), use base_dir so that
+        # rel_paths look like  "myservice/src/Foo.java" (service name preserved).
+        # When dir_path is an external project (e.g. /Users/x/work/sp), use
+        # dir_path.parent so that rel_paths look like "sp/src/Foo.php".
+        try:
+            dir_path.relative_to(self.base_dir)
+            root_for_rel_path = self.base_dir
+        except ValueError:
+            root_for_rel_path = dir_path.parent
+
         # ── 1. Scan all indexable files & compute hashes ─────────
         logger.info(f"Scanning files in {dir_path}")
         current_files: Dict[str, str] = {}  # {rel_path: md5}
@@ -878,9 +1152,9 @@ class IndexerService:
             if not file_path.is_file():
                 continue
             try:
-                rel_path = str(file_path.relative_to(self.base_dir))
+                rel_path = str(file_path.relative_to(root_for_rel_path))
             except ValueError:
-                rel_path = str(file_path).lstrip("/")
+                rel_path = str(file_path)  # fallback: store absolute path as-is
 
             if self._is_excluded(Path(rel_path)):
                 continue
@@ -890,6 +1164,13 @@ class IndexerService:
                 current_files[rel_path] = h
 
         logger.info(f"Found {len(current_files)} indexable files")
+
+        # Build service name map from manifests (composer.json, pom.xml, *.csproj, package.json)
+        service_map = self._build_service_map(dir_path)
+        logger.info(f"Built service map with {len(service_map)} entries")
+
+        # Build PHP routes map for enricher (http_path for PHP controller methods)
+        routes_map = parse_routes_files(str(dir_path))
 
         # ── 2. Fetch stored hashes from both DBs ─────────────────
         try:
@@ -909,7 +1190,16 @@ class IndexerService:
         qdrant_changed: Set[str] = {
             p for p, h in current_files.items() if qdrant_hashes.get(p) != h
         }
-        qdrant_deleted: Set[str] = set(qdrant_hashes) - set(current_files)
+        # Scope deletions to files within the currently scanned directory only.
+        # Without this, scanning a subdirectory would delete Qdrant entries from other dirs.
+        try:
+            _qdrant_prefix = str(dir_path.relative_to(root_for_rel_path))
+        except ValueError:
+            _qdrant_prefix = ""
+        qdrant_deleted: Set[str] = {
+            p for p in (set(qdrant_hashes) - set(current_files))
+            if not _qdrant_prefix or p.startswith(_qdrant_prefix)
+        }
 
         # For AuraDB: group .cs files by nearest .sln, .java files by nearest pom.xml
         # Solution hash = aggregate MD5 of all constituent source files
@@ -918,16 +1208,15 @@ class IndexerService:
 
         if self.graph_store:
             sln_files = [p for p in current_files if p.lower().endswith(".sln")]
-            pom_files = [p for p in current_files
-                         if p.endswith("pom.xml") or p.lower().endswith("build.gradle")]
+            pom_files = [p for p in current_files if p.endswith("pom.xml")]
 
-            # Pre-compute analyzer source hashes so that changing SpoonAnalyzer.java
-            # or RoslynAnalyzer source invalidates stored AuraDB hashes even when
-            # the project's own source files haven't changed.
+            # Pre-compute analyzer source hashes so that changing analyzer source
+            # invalidates stored AuraDB hashes even when project files haven't changed.
             _analyzers_root = Path(__file__).parent.parent / "analyzers"
             _csharp_analyzer_hash = self._dir_hash(_analyzers_root / "csharp")
             _java_analyzer_hash   = self._dir_hash(_analyzers_root / "java")
             _php_analyzer_hash    = self._dir_hash(_analyzers_root / "php")
+            _scip_analyzer_hash   = self._dir_hash(_analyzers_root / "scip")
 
             for sln_path in sln_files:
                 sln_dir = str(Path(sln_path).parent)
@@ -977,7 +1266,75 @@ class IndexerService:
                 if graph_hashes.get(composer_path) != agg:
                     solutions_changed.add(composer_path)
 
-            graph_deleted = set(graph_hashes) - set(current_files)
+            # SCIP: use package.json (TypeScript/JS), go.mod (Go) as project anchors.
+            # Only consider package.json files that have .ts/.js sibling source files
+            # (ignores composer.json companion package.json in PHP projects).
+            # Python is not yet supported (scip-python not available on PyPI).
+            # Java/Kotlin (pom.xml): pom.xml → Spoon (below).
+            # build.gradle/.kts → tree-sitter (scip-java does NOT support Android AGP).
+            _SCIP_ANCHORS = {
+                "package.json": (".ts", ".tsx", ".js", ".jsx"),
+                "go.mod":       (".go",),
+            }
+            for anchor_name, src_exts in _SCIP_ANCHORS.items():
+                anchor_files = [p for p in current_files if Path(p).name == anchor_name]
+                for anchor_path in anchor_files:
+                    anchor_dir = str(Path(anchor_path).parent)
+                    # package.json without tsconfig.json → not a TypeScript project, skip
+                    if anchor_name == "package.json":
+                        _anchor_abs = (root_for_rel_path / anchor_dir) if anchor_dir else dir_path
+                        if not (_anchor_abs / "tsconfig.json").exists():
+                            continue
+                    constituent = {
+                        p: h for p, h in current_files.items()
+                        if p.startswith(anchor_dir)
+                        and any(p.lower().endswith(ext) for ext in src_exts)
+                        and "/node_modules/" not in p
+                        and "/.venv/" not in p
+                        and "/vendor/" not in p
+                    }
+                    if not constituent:
+                        continue
+                    agg = self._aggregate_hash({
+                        **constituent,
+                        "__scip_analyzer__": _scip_analyzer_hash,
+                    })
+                    if graph_hashes.get(anchor_path) != agg:
+                        solutions_changed.add(anchor_path)
+
+            # Gradle (Kotlin/Java/Android): tree-sitter based symbol extraction for Pipeline B.
+            # scip-java does NOT support Android AGP, so we use ASTChunkerAnalyzer directly.
+            _GRADLE_ANCHORS = {
+                "build.gradle":     (".java", ".kt", ".kts"),
+                "build.gradle.kts": (".java", ".kt", ".kts"),
+            }
+            for anchor_name, src_exts in _GRADLE_ANCHORS.items():
+                for anchor_path in [p for p in current_files if Path(p).name == anchor_name]:
+                    anchor_dir = str(Path(anchor_path).parent)
+                    constituent = {
+                        p: h for p, h in current_files.items()
+                        if p.startswith(anchor_dir + "/")
+                        and any(p.lower().endswith(ext) for ext in src_exts)
+                        and "/build/" not in p.replace("\\", "/")
+                    }
+                    if not constituent:
+                        continue
+                    agg = self._aggregate_hash(constituent)
+                    if graph_hashes.get(anchor_path) != agg:
+                        solutions_changed.add(anchor_path)
+
+            # Only delete File nodes that are WITHIN the current scan's directory scope.
+            # Without this scoping, indexing a subdirectory would delete all File nodes
+            # from other subdirectories (e.g. indexing paybnbservice would delete memberservice).
+            # rel_prefix is computed relative to root_for_rel_path (same basis as current_files).
+            try:
+                _scan_prefix = str(dir_path.relative_to(root_for_rel_path))
+            except ValueError:
+                _scan_prefix = ""
+            graph_deleted = {
+                p for p in (set(graph_hashes) - set(current_files))
+                if not _scan_prefix or p.startswith(_scan_prefix)
+            }
 
         logger.info(
             f"Qdrant: {len(qdrant_changed)} to index, {len(qdrant_deleted)} to delete | "
@@ -990,10 +1347,11 @@ class IndexerService:
         qdrant_indexed = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             future_qdrant = executor.submit(
-                self._pipeline_qdrant, qdrant_changed, current_files, dir_path
+                self._pipeline_qdrant, qdrant_changed, current_files, dir_path, root_for_rel_path, service_map
             )
             future_graph = executor.submit(
-                self._pipeline_graph, solutions_changed, current_files, dir_path
+                self._pipeline_graph, solutions_changed, current_files, dir_path,
+                root_for_rel_path, routes_map, service_map
             ) if self.graph_store and solutions_changed else None
 
             qdrant_result = future_qdrant.result()
@@ -1113,7 +1471,12 @@ class IndexerService:
         if self.graph_store:
             logger.info("Running post-processing for graph store...")
             try:
-                self.graph_store.compute_communities()
+                if os.getenv("GRAPH_COMMUNITY_ENABLED", "true").lower() != "false":
+                    self.graph_store.compute_communities()
+                else:
+                    logger.info("Community detection skipped (GRAPH_COMMUNITY_ENABLED=false)")
+                self.graph_store.resolve_stub_calls()
+                self.graph_store.resolve_virtual_dispatch()
                 self.graph_store.compute_execution_flows()
             except Exception as e:
                 logger.error(f"Post-processing failed: {e}")
@@ -1123,6 +1486,8 @@ class IndexerService:
         changed_files: Set[str],
         current_files: Dict[str, str],
         dir_path: Path,
+        root_for_rel_path: Optional[Path] = None,
+        service_map: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Pipeline A: index changed files into Qdrant via TreeSitter/Markdown/YAML."""
         from .markdown_analyzer import MarkdownAnalyzer
@@ -1146,9 +1511,14 @@ class IndexerService:
             if file_num % log_interval == 0 or file_num == total_files:
                 logger.info(f"Pipeline A progress: {file_num}/{total_files} files processed, {indexed} chunks indexed so far")
 
-            abs_path = dir_path / rel_path if not Path(rel_path).is_absolute() else Path(rel_path)
-            if not abs_path.exists():
-                abs_path = self.base_dir / rel_path
+            if Path(rel_path).is_absolute():
+                abs_path = Path(rel_path)
+            elif root_for_rel_path is not None:
+                abs_path = root_for_rel_path / rel_path
+            else:
+                abs_path = dir_path / rel_path
+                if not abs_path.exists():
+                    abs_path = self.base_dir / rel_path
 
             ext = Path(rel_path).suffix.lower()
             file_hash = current_files[rel_path]
@@ -1182,7 +1552,7 @@ class IndexerService:
                         "symbol_type": sym.get("node_type"),
                         "category": EXT_CATEGORY_MAP.get(ext, ("other", None))[0],
                         "language": result.language or EXT_CATEGORY_MAP.get(ext, ("other", None))[1] or "",
-                        "service": rel_path.split("/")[0] if "/" in rel_path else "",
+                        "service": self._resolve_service(abs_path, dir_path, service_map) if service_map else None,
                         "file_hash": file_hash,
                     }
                     for k, v in sym.items():
@@ -1213,16 +1583,21 @@ class IndexerService:
         solutions: Set[str],
         current_files: Dict[str, str],
         dir_path: Path,
+        root_for_rel_path: Optional[Path] = None,
+        routes_map: Optional[Dict] = None,
+        service_map: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Pipeline B: re-analyze changed solutions with Roslyn/Spoon/PHP-Parser → AuraDB."""
         from .project_detector import AnalyzerType
         import tempfile
 
+        _root = root_for_rel_path or self.base_dir
+
         errors: List[Dict] = []
         processed = 0
 
         for sln_rel_path in sorted(solutions):
-            abs_sln = self.base_dir / sln_rel_path
+            abs_sln = _root / sln_rel_path
             if not abs_sln.exists():
                 abs_sln = dir_path / sln_rel_path
             if not abs_sln.exists():
@@ -1240,14 +1615,13 @@ class IndexerService:
                     continue
 
                 try:
-                    from .project_detector import ProjectDetector
-                    detector = ProjectDetector(dir_path)
-                    detector_type = detector.detect_project_type(
-                        dir_path / composer_dir if composer_dir else dir_path
-                    )
-                    php_analyzer_type = detector.get_analyzer_for_file(
-                        Path(php_files[0]), detector_type
-                    )
+                    from .project_detector import ProjectDetector, AnalyzerType as AT
+                    # composer.json confirms this is a PHP project — use PHP_PARSER directly.
+                    # Avoid detect_project_type which may return MIXED (when the project also has
+                    # package.json) and fall back to TreeSitter for .php files.
+                    php_analyzer_type = AT.PHP_PARSER
+                    _php_project_dir = (_root / composer_dir) if composer_dir else dir_path
+                    detector = ProjectDetector(_php_project_dir)
                     # Only proceed if PHP-Parser Docker is available
                     if not detector.is_analyzer_available(php_analyzer_type,
                                                           "agentic-rag-php-analyzer:latest"):
@@ -1260,16 +1634,19 @@ class IndexerService:
                     php_analyzer = AnalyzerFactory.create_auto("", php_analyzer_type)
                     php_processed = 0
                     for php_rel_path in php_files:
-                        abs_php = dir_path / php_rel_path
+                        abs_php = _root / php_rel_path
                         if not abs_php.exists():
-                            abs_php = self.base_dir / php_rel_path
+                            abs_php = dir_path / php_rel_path
                         if not abs_php.exists():
                             continue
                         try:
                             result = php_analyzer.analyze(str(abs_php))
                             self._ingest_analysis_to_graph(
                                 result, php_rel_path,
-                                current_files.get(php_rel_path, "")
+                                current_files.get(php_rel_path, ""),
+                                routes_map=routes_map,
+                                service_map=service_map,
+                                root_for_rel_path=root_for_rel_path,
                             )
                             php_processed += 1
                         except Exception as e:
@@ -1298,8 +1675,204 @@ class IndexerService:
                 continue
             # ── END PHP handling ──────────────────────────────────────────────
 
+            # ── Tree-sitter: Kotlin/Java (Gradle projects) ───────────────────
+            if abs_sln.name in ("build.gradle", "build.gradle.kts"):
+                from .ast_chunker import ASTChunkerAnalyzer as _ASTAnalyzer
+                anchor_dir = str(Path(sln_rel_path).parent)
+
+                kt_java_files = sorted(
+                    p for p in current_files
+                    if p.startswith(anchor_dir + "/")
+                    and Path(p).suffix.lower() in (".kt", ".java", ".kts")
+                    and "/build/" not in p.replace("\\", "/")
+                )
+                if not kt_java_files:
+                    logger.info(f"No .kt/.java files for {anchor_dir}, skipping")
+                    continue
+
+                ts_analyzer = _ASTAnalyzer()
+                all_graph_symbols: List[Dict] = []
+                all_relationships: List[Dict] = []
+
+                for file_rel in kt_java_files:
+                    file_abs = str(_root / file_rel)
+                    self.graph_store.delete_by_file(file_rel, project=self.graph_store.default_project)
+                    try:
+                        file_result = ts_analyzer.analyze(file_abs)
+                        lang = Path(file_rel).suffix.lstrip(".")
+                        svc = None
+                        if service_map and root_for_rel_path:
+                            _top = anchor_dir.split("/")[0]
+                            svc = self._resolve_service(
+                                root_for_rel_path / file_rel,
+                                root_for_rel_path / _top,
+                                service_map,
+                            )
+                        for sym in file_result.symbols:
+                            fqn = sym.get("fqn") or sym.get("name", "unknown")
+                            short_name = fqn.split(".")[-1].split("(")[0]
+                            all_graph_symbols.append({
+                                "fqn": fqn,
+                                "name": short_name,
+                                "kind": sym.get("node_type", ""),
+                                "file_path": file_rel,
+                                "namespace": sym.get("namespace", ""),
+                                "start_line": sym.get("start_line", 0),
+                                "end_line": sym.get("end_line", 0),
+                                "project": self.graph_store.default_project,
+                                "language": lang,
+                                "service": svc,
+                                "is_test": sym.get("is_test"),
+                            })
+                        all_relationships.extend(file_result.relationships)
+                    except Exception as e:
+                        logger.warning(f"tree-sitter error for {file_rel}: {e}")
+
+                _anchor_meta = {
+                    "service": sln_rel_path.split("/")[0] if "/" in sln_rel_path else "",
+                    "layer": "", "category": "source-code", "language": "kotlin",
+                }
+                self.graph_store.upsert_file_node(
+                    sln_rel_path, _anchor_meta,
+                    project=self.graph_store.default_project, hash=None,
+                )
+                if all_graph_symbols:
+                    self.graph_store.upsert_symbols(all_graph_symbols)
+                if all_relationships:
+                    try:
+                        self.graph_store.upsert_relationships(all_relationships)
+                    except Exception as e:
+                        logger.warning(f"Relationship upsert error for {anchor_dir}: {e}")
+
+                constituent = {p: h for p, h in current_files.items() if p in set(kt_java_files)}
+                agg_hash = self._aggregate_hash(constituent)
+                self.graph_store.upsert_file_node(
+                    sln_rel_path, _anchor_meta,
+                    project=self.graph_store.default_project, hash=agg_hash,
+                )
+                logger.info(
+                    f"Tree-sitter (gradle): {len(all_graph_symbols)} symbols from "
+                    f"{len(kt_java_files)} files for {anchor_dir}"
+                )
+                processed += 1
+                continue
+            # ── END Gradle tree-sitter handling ──────────────────────────────
+
+            # ── SCIP: TypeScript / Go ─────────────────────────────────────────
+            _SCIP_ANCHOR_NAMES = {
+                "package.json": ("typescript", (".ts", ".tsx", ".js", ".jsx")),
+                "go.mod":       ("go",         (".go",)),
+            }
+            if abs_sln.name in _SCIP_ANCHOR_NAMES:
+                scip_lang, scip_exts = _SCIP_ANCHOR_NAMES[abs_sln.name]
+                anchor_dir = str(Path(sln_rel_path).parent)
+                anchor_abs = (_root / anchor_dir) if anchor_dir else dir_path
+
+                # For package.json (TypeScript), require tsconfig.json to be present —
+                # otherwise this is a non-TypeScript project (Java/PHP with tooling only).
+                if abs_sln.name == "package.json":
+                    if not (anchor_abs / "tsconfig.json").exists():
+                        continue
+
+                # Collect source files for this anchor
+                scip_src_files = sorted(
+                    p for p in current_files
+                    if p.startswith(anchor_dir)
+                    and any(p.lower().endswith(ext) for ext in scip_exts)
+                    and "/node_modules/" not in p
+                    and "/.venv/" not in p
+                    and "/vendor/" not in p
+                )
+                if not scip_src_files:
+                    continue
+
+                try:
+                    from .project_detector import ProjectDetector, AnalyzerType as AT
+                    _scip_image = os.getenv("ANALYZER_SCIP_IMAGE", "agentic-rag-scip-analyzer:latest")
+                    detector = ProjectDetector(abs_sln.parent)
+                    if not detector.is_analyzer_available(AT.SCIP, _scip_image):
+                        logger.warning(
+                            f"SCIP Docker unavailable for {anchor_dir}, "
+                            "skipping graph (Qdrant tree-sitter indexing still runs)"
+                        )
+                        continue
+
+                    from ..analyzers.scip.parser import parse_scip_json
+                    from .docker_analyzer import DockerAnalyzer
+                    from pathlib import Path as _Path
+                    import subprocess as _sub, json as _json
+
+                    anchor_abs = (_root / anchor_dir) if anchor_dir else dir_path
+
+                    _scip_analyzer_src = str(
+                        _Path(__file__).parent.parent / "analyzers" / "scip"
+                    )
+
+                    # Use DockerAnalyzer only for auto-rebuild, then run Docker manually.
+                    # (DockerAnalyzer.analyze() is file-centric; SCIP needs a project-dir mount.)
+                    _da = DockerAnalyzer(image=_scip_image, source_dir=_scip_analyzer_src)
+                    _da._ensure_image_current()
+
+                    # Mount ~/.nuget not needed for SCIP, but nuget for Go deps may matter
+                    docker_cmd = [
+                        "docker", "run", "--rm",
+                        "-v", f"{anchor_abs}:/src",
+                        _scip_image,
+                        "/src", scip_lang,
+                    ]
+                    logger.info(f"Running SCIP: {' '.join(docker_cmd)}")
+                    _proc = _sub.run(docker_cmd, capture_output=True, text=True)
+                    if _proc.returncode != 0:
+                        raise RuntimeError(
+                            f"SCIP Docker failed:\n{_proc.stderr[-2000:]}"
+                        )
+
+                    raw_output = _proc.stdout.strip()
+                    if not raw_output:
+                        logger.warning(f"SCIP produced no output for {anchor_dir}")
+                        continue
+
+                    scip_data = _json.loads(raw_output)
+
+                    # project_rel_prefix: path from root_for_rel_path to anchor dir
+                    project_rel_prefix = anchor_dir.rstrip("/")
+
+                    from types import SimpleNamespace as _NS
+                    _scip_dict = parse_scip_json(
+                        scip_data,
+                        project_abs_dir=str(anchor_abs),
+                        project_rel_prefix=project_rel_prefix,
+                        language=scip_lang,
+                    )
+                    # _ingest_analysis_to_graph expects an object with .language/.symbols/.relationships
+                    result = _NS(**_scip_dict)
+
+                    # Compute aggregate hash
+                    constituent = {p: h for p, h in current_files.items()
+                                   if p in set(scip_src_files)}
+                    agg_hash = self._aggregate_hash(constituent)
+
+                    self._ingest_analysis_to_graph(
+                        result, sln_rel_path, agg_hash,
+                        routes_map=routes_map,
+                        service_map=service_map,
+                        root_for_rel_path=root_for_rel_path,
+                    )
+                    n_syms = len(result.symbols)
+                    logger.info(
+                        f"SCIP ({scip_lang}): {n_syms} symbols indexed for {anchor_dir}"
+                    )
+                    processed += 1
+
+                except Exception as e:
+                    logger.error(f"SCIP pipeline error for {sln_rel_path}: {e}", exc_info=True)
+                    errors.append({"solution": sln_rel_path, "error": str(e)})
+                continue
+            # ── END SCIP handling ─────────────────────────────────────────────
+
             ext = Path(sln_rel_path).suffix.lower()
-            is_java = abs_sln.name in ("pom.xml",) or ext in (".gradle",)
+            # Only pom.xml reaches here (build.gradle/.kts are tree-sitter only).
+            is_java = abs_sln.name == "pom.xml"
             analyzer_type = AnalyzerType.SPOON if is_java else AnalyzerType.ROSLYN
 
             try:
@@ -1316,7 +1889,12 @@ class IndexerService:
                 agg_hash = self._aggregate_hash(constituent)
 
                 # Write to AuraDB (reuse existing logic)
-                self._ingest_analysis_to_graph(result, sln_rel_path, agg_hash)
+                self._ingest_analysis_to_graph(
+                    result, sln_rel_path, agg_hash,
+                    routes_map=routes_map,
+                    service_map=service_map,
+                    root_for_rel_path=root_for_rel_path,
+                )
                 processed += 1
 
             except Exception as e:
@@ -1327,7 +1905,10 @@ class IndexerService:
         return {"solutions": processed, "errors": errors}
 
     def _ingest_analysis_to_graph(
-        self, result: Any, sln_rel_path: str, agg_hash: str
+        self, result: Any, sln_rel_path: str, agg_hash: str,
+        routes_map: Optional[Dict] = None,
+        service_map: Optional[Dict[str, str]] = None,
+        root_for_rel_path: Optional[Path] = None,
     ):
         """Write Roslyn/Spoon AnalysisResult into AuraDB (reused from index_analysis_artifacts logic)."""
         from pathlib import Path as P
@@ -1339,6 +1920,7 @@ class IndexerService:
         }
 
         sln_dir = str(P(sln_rel_path).parent)
+        _lang = (result.language or "").lower()
 
         # Delete old data
         self.graph_store.delete_by_file(sln_rel_path, project=self.graph_store.default_project)
@@ -1371,15 +1953,60 @@ class IndexerService:
                 if docker_path.startswith("/src/")
                 else sln_rel_path
             )
+
+            # ── Pure pass-through: each analyzer (Spoon/PHP/Roslyn) is responsible
+            # for emitting all semantic fields in its output. No Python post-processing.
+            meta = sym.get("metadata", {}) or {}
+
+            def _get(key):
+                """Read from top-level first (Spoon), fall back to metadata."""
+                v = sym.get(key)
+                return v if v is not None else meta.get(key)
+
+            # Resolve service from service_map
+            if service_map and root_for_rel_path:
+                abs_file = root_for_rel_path / actual_file_path
+                service_name = self._resolve_service(abs_file, root_for_rel_path / sln_dir.split("/")[0], service_map)
+            else:
+                service_name = None
+
+            # PHP transitional: look up http_path from routes_map until analyze.php is updated
+            # to emit these fields directly. For Java, SpoonAnalyzer already emits them.
+            php_http_info: Dict[str, Any] = {}
+            if _lang == "php" and routes_map and sym.get("node_type") == "method":
+                from .php_routes_parser import get_route_info
+                parts = fqn.replace("::", ".").split(".")
+                if len(parts) >= 2:
+                    info = get_route_info(routes_map, parts[-2], parts[-1])
+                    if info:
+                        php_http_info = info
+
             graph_symbols.append({
                 "fqn": fqn,
                 "name": short_name,
                 "kind": sym.get("node_type", ""),
                 "file_path": actual_file_path,
-                "namespace": sym.get("metadata", {}).get("namespace", ""),
+                "namespace": meta.get("namespace", ""),
                 "start_line": sym.get("start_line", 0),
                 "end_line": sym.get("end_line", 0),
                 "project": self.graph_store.default_project,
+                # Fields emitted directly by the analyzer
+                "language": _lang,
+                "service": service_name,
+                "visibility": _get("visibility"),
+                "is_static": _get("is_static"),
+                "is_abstract": _get("is_abstract"),
+                "is_deprecated": _get("is_deprecated"),
+                "is_test": _get("is_test"),
+                "file_type": _get("file_type"),
+                "entry_point_type": _get("entry_point_type") or php_http_info.get("entry_point_type"),
+                "http_method": _get("http_method") or php_http_info.get("http_method"),
+                "http_path": _get("http_path") or php_http_info.get("http_path"),
+                "auth_required": _get("auth_required") if _get("auth_required") is not None else php_http_info.get("auth_required"),
+                "auth_roles": _get("auth_roles"),
+                "table_name": _get("table_name"),
+                "operation_type": _get("operation_type"),
+                "makes_http_call": _get("makes_http_call"),
             })
             # Synthesize enum MEMBER_OF edges
             if sym.get("node_type") == "enum_member":

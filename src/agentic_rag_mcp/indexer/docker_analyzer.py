@@ -41,14 +41,25 @@ class DockerAnalyzer(BaseAnalyzer):
 
     # ── Auto-rebuild helpers ──────────────────────────────────────────────────
 
+    # Directories to skip when computing the source hash (build/cache artifacts)
+    _HASH_EXCLUDE_DIRS = {".agentic-rag-cache", "target", "node_modules", ".venv",
+                          "__pycache__", ".gradle", "build", "dist", ".mvn"}
+
     def _compute_source_hash(self) -> Optional[str]:
-        """MD5 of every file under source_dir, sorted for determinism."""
+        """MD5 of every source file under source_dir, sorted for determinism.
+
+        Excludes build/cache directories so that runtime-generated files (Qdrant
+        embedding cache, Maven target, etc.) don't cause spurious image rebuilds.
+        """
         src = Path(self.source_dir)
         if not src.exists():
             logger.warning(f"source_dir not found: {src}")
             return None
         h = hashlib.md5()
         for f in sorted(src.rglob("*")):
+            # Skip excluded directories
+            if any(part in self._HASH_EXCLUDE_DIRS for part in f.parts):
+                continue
             if f.is_file():
                 try:
                     h.update(f.read_bytes())

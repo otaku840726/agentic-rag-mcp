@@ -28,6 +28,12 @@ _java_parser = None
 _GRAMMAR_MAP: Dict[str, tuple] = {
     # ── .NET ──
     ".cs":         ("tree_sitter_c_sharp",    "language"),
+    # ── C / C++ ──
+    ".c":          ("tree_sitter_c",           "language"),
+    ".h":          ("tree_sitter_c",           "language"),
+    ".cpp":        ("tree_sitter_cpp",         "language"),
+    ".cc":         ("tree_sitter_cpp",         "language"),
+    ".hpp":        ("tree_sitter_cpp",         "language"),
     # ── JVM ──
     ".java":       ("tree_sitter_java",        "language"),
     ".kt":         ("tree_sitter_kotlin",      "language"),
@@ -38,6 +44,7 @@ _GRAMMAR_MAP: Dict[str, tuple] = {
     ".js":         ("tree_sitter_javascript",  "language"),
     ".jsx":        ("tree_sitter_javascript",  "language"),
     ".cjs":        ("tree_sitter_javascript",  "language"),
+    ".mjs":        ("tree_sitter_javascript",  "language"),
     ".ts":         ("tree_sitter_typescript",  "language_typescript"),
     ".tsx":        ("tree_sitter_typescript",  "language_tsx"),
     # ── Go ──

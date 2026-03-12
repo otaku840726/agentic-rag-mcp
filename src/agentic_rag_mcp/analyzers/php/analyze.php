@@ -91,20 +91,105 @@ function visibilityStr(int $flags): string {
 }
 
 /**
+ * Classify file_type from file path and class name.
+ */
+function classifyFileType(string $filePath, string $className, string $content): ?string {
+    $fp   = strtolower(str_replace('\\', '/', $filePath));
+    $name = strtolower($className);
+
+    if (str_contains($fp, '/test') || str_contains($fp, 'test/')) return 'test';
+    if (str_contains($fp, '/migrations/') || str_contains($fp, 'database/migrations')) return 'migration';
+    if (preg_match('#/routes/[^/]+\.php$#', $fp)) return 'routes';
+    if (str_contains($fp, 'http/controllers') || str_contains($fp, '/controllers/')) return 'controller';
+    if (str_contains($fp, '/middleware/')) return 'middleware';
+    if (str_contains($fp, '/requests/')) return 'dto';
+    if (str_contains($fp, '/resources/') || str_contains($fp, '/transformers/')) return 'dto';
+    if (str_contains($fp, '/repositories/')) return 'repository';
+    if (str_contains($fp, '/services/')) return 'service';
+    if (str_contains($fp, '/models/') || preg_match('/extends\s+Model\b/', $content)) return 'entity';
+    if (str_contains($fp, '/listeners/') || str_ends_with($name, 'listener')) return 'event_listener';
+    if (str_contains($fp, '/jobs/') || str_ends_with($name, 'job')) return 'job';
+    if (str_contains($fp, '/events/') || str_ends_with($name, 'event')) return 'event_listener';
+    if (str_contains($fp, '/config/')) return 'config';
+    if (str_ends_with($name, 'controller')) return 'controller';
+    if (str_ends_with($name, 'service')) return 'service';
+    if (str_ends_with($name, 'repository') || str_ends_with($name, 'repo')) return 'repository';
+    if (str_ends_with($name, 'middleware')) return 'middleware';
+    if (preg_match('/implements\s+ShouldQueue\b/', $content)) return 'queue_worker';
+    return null;
+}
+
+/**
+ * Extract table_name from Eloquent model content.
+ */
+function extractTableName(string $className, string $content): ?string {
+    if (preg_match('/protected\s+\$table\s*=\s*[\'"]([^\'"]+)[\'"]/', $content, $m)) {
+        return $m[1];
+    }
+    // Eloquent default: class name → plural snake_case
+    if (preg_match('/extends\s+Model\b/', $content)) {
+        return pluralizeSnake(camelToSnake($className));
+    }
+    return null;
+}
+
+function camelToSnake(string $name): string {
+    $s = preg_replace('/([A-Z]+)([A-Z][a-z])/', '$1_$2', $name);
+    $s = preg_replace('/([a-z\d])([A-Z])/', '$1_$2', $s);
+    return strtolower($s);
+}
+
+function pluralizeSnake(string $name): string {
+    if (str_ends_with($name, 'y')) return substr($name, 0, -1) . 'ies';
+    if (preg_match('/(s|x|z|ch|sh)$/', $name)) return $name . 'es';
+    return $name . 's';
+}
+
+/**
+ * Derive operation_type from method name heuristics.
+ */
+function extractOperationType(string $methodName): ?string {
+    $n = strtolower($methodName);
+    if (preg_match('/^(save|insert|update|delete|destroy|remove|create|add|put|store|write|force)/', $n)) return 'WRITE';
+    if (preg_match('/^(find|get|load|fetch|select|read|list|count|exists|query|search|show|index|all|first)/', $n)) return 'READ';
+    return null;
+}
+
+/**
+ * Detect HTTP client usage in content.
+ */
+function detectHttpCall(string $content): bool {
+    return (bool) preg_match('/\b(Http::|Guzzle|GuzzleHttp|getData\s*\(|curl_exec|file_get_contents)\b/', $content);
+}
+
+/**
+ * Check if this is a test file.
+ */
+function isTestFile(string $filePath, string $className): bool {
+    $fp = strtolower($filePath);
+    return str_contains($fp, '/test') || str_contains($fp, 'test/')
+        || str_ends_with(strtolower($className), 'test')
+        || str_ends_with(strtolower($className), 'spec');
+}
+
+/**
  * Recursively walk the AST, collecting symbols and relationships.
  */
 function walkStmts(
-    array  $stmts,
-    array  $lines,
-    string $currentNamespace,
-    string $parentFqn,
-    array  &$symbols,
-    array  &$rels
+    array   $stmts,
+    array   $lines,
+    string  $currentNamespace,
+    string  $parentFqn,
+    array   &$symbols,
+    array   &$rels,
+    string  $filePath = '',
+    ?string $classFileType = null,
+    ?string $classTableName = null
 ): void {
     foreach ($stmts as $stmt) {
         if ($stmt instanceof Stmt\Namespace_) {
             $ns = $stmt->name ? $stmt->name->toString() : '';
-            walkStmts($stmt->stmts, $lines, $ns, '', $symbols, $rels);
+            walkStmts($stmt->stmts, $lines, $ns, '', $symbols, $rels, $filePath);
             continue;
         }
 
@@ -171,43 +256,61 @@ function walkStmts(
                 $kind = 'trait';
             }
 
-            $symbols[] = [
+            $classContent  = nodeContent($lines, $stmt);
+            $classFileType = classifyFileType($filePath, $name, $classContent);
+            $classTableName = ($kind === 'class') ? extractTableName($name, $classContent) : null;
+
+            $symbols[] = array_filter([
                 'fqn'         => $fqn,
                 'name'        => $name,
                 'kind'        => $kind,
                 'namespace'   => $currentNamespace,
                 'start_line'  => $stmt->getStartLine() ?? 0,
                 'end_line'    => $stmt->getEndLine()   ?? 0,
-                'content'     => nodeContent($lines, $stmt),
-                'node_type'   => $kind,          // alias used by Qdrant payload
+                'content'     => $classContent,
+                'node_type'   => $kind,
                 'is_abstract' => ($stmt instanceof Stmt\Class_ && $stmt->isAbstract()),
                 'is_static'   => false,
                 'visibility'  => 'public',
-            ];
+                'is_test'     => isTestFile($filePath, $name),
+                'file_type'   => $classFileType,
+                'table_name'  => $classTableName,
+            ], fn($v) => $v !== null);
 
-            // Walk class/interface/trait body for methods
-            walkStmts($stmt->stmts ?? [], $lines, $currentNamespace, $fqn, $symbols, $rels);
+            // Walk class/interface/trait body for methods (pass class-level context)
+            walkStmts($stmt->stmts ?? [], $lines, $currentNamespace, $fqn, $symbols, $rels,
+                      $filePath, $classFileType, $classTableName);
             continue;
         }
 
         // ── Methods ───────────────────────────────────────────────────────
         if ($stmt instanceof Stmt\ClassMethod) {
-            $methodName = $stmt->name->toString();
-            $fqn = $parentFqn ? "$parentFqn::$methodName" : $methodName;
+            $methodName    = $stmt->name->toString();
+            $fqn           = $parentFqn ? "$parentFqn::$methodName" : $methodName;
+            $methodContent = nodeContent($lines, $stmt);
+            $opType        = extractOperationType($methodName);
+            $makesHttp     = detectHttpCall($methodContent);
 
-            $symbols[] = [
-                'fqn'         => $fqn,
-                'name'        => $methodName,
-                'kind'        => 'method',
-                'namespace'   => $currentNamespace,
-                'start_line'  => $stmt->getStartLine() ?? 0,
-                'end_line'    => $stmt->getEndLine()   ?? 0,
-                'content'     => nodeContent($lines, $stmt),
-                'node_type'   => 'method',
-                'visibility'  => visibilityStr($stmt->flags),
-                'is_static'   => $stmt->isStatic(),
-                'is_abstract' => $stmt->isAbstract(),
+            $sym = [
+                'fqn'            => $fqn,
+                'name'           => $methodName,
+                'kind'           => 'method',
+                'namespace'      => $currentNamespace,
+                'start_line'     => $stmt->getStartLine() ?? 0,
+                'end_line'       => $stmt->getEndLine()   ?? 0,
+                'content'        => $methodContent,
+                'node_type'      => 'method',
+                'visibility'     => visibilityStr($stmt->flags),
+                'is_static'      => $stmt->isStatic(),
+                'is_abstract'    => $stmt->isAbstract(),
+                'is_test'        => isTestFile($filePath, $methodName),
+                'file_type'      => $classFileType,
+                'operation_type' => $opType,
             ];
+            if ($classTableName !== null) $sym['table_name']     = $classTableName;
+            if ($makesHttp)              $sym['makes_http_call'] = true;
+
+            $symbols[] = $sym;
 
             if ($parentFqn) {
                 $rels[] = [
@@ -315,7 +418,7 @@ function extractCalls(array $stmts, string $callerFqn, array &$rels): void {
     $traverser->traverse($stmts);
 }
 
-walkStmts($ast, $lines, '', '', $symbols, $rels);
+walkStmts($ast, $lines, '', '', $symbols, $rels, $filePath);
 
 // ── Output ───────────────────────────────────────────────────────────────────
 
